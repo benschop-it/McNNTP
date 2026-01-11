@@ -58,7 +58,7 @@ namespace McNNTP.Tests
             Console.WriteLine(compressedBytes.Select(b => b.ToString("x2")).Aggregate((c, n) => $"{c} {n}"));
 
             Assert.IsNotNull(compressedBytes);
-            Assert.AreEqual(deflated.Length, compressedBytes.Length);
+            Assert.HasCount(deflated.Length, compressedBytes);
             Assert.IsTrue(Enumerable.SequenceEqual(deflated, compressedBytes));
 
             var decompressedData = await deflated.ZlibInflate(CancellationToken.None);

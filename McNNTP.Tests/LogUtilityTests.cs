@@ -78,14 +78,14 @@ namespace McNNTP.Tests
         [TestMethod]
         public void Verbose_WithNullMessage_ThrowsException()
         {
-            Assert.ThrowsException<ArgumentNullException>(() => 
+            Assert.ThrowsExactly<ArgumentNullException>(() => 
                 _mockLogger.Object.Verbose(null!));
         }
 
         [TestMethod]
         public void VerboseFormat_WithNullFormat_ThrowsException()
         {
-            Assert.ThrowsException<ArgumentNullException>(() => 
+            Assert.ThrowsExactly<ArgumentNullException>(() => 
                 _mockLogger.Object.VerboseFormat(null!, "arg"));
         }
     }

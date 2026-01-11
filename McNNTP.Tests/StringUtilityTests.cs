@@ -85,9 +85,9 @@ namespace McNNTP.Tests
             var result = await input.ZlibDeflate(CancellationToken.None);
             
             Assert.IsNotNull(result);
-            Assert.IsTrue(result.Length > 0);
+            Assert.IsNotEmpty(result);
             var inputLength = Encoding.UTF8.GetBytes(input).Length;
-            Assert.IsTrue(result.Length < inputLength, $"Expected deflated length {result.Length} to be less than input length {inputLength}.");
+            Assert.IsLessThan(inputLength, result.Length, $"Expected deflated length {result.Length} to be less than input length {inputLength}.");
         }
 
         [TestMethod]
@@ -108,7 +108,7 @@ namespace McNNTP.Tests
             var result = await compressed.ZlibInflate(CancellationToken.None);
             
             Assert.AreEqual(input, result);
-            Assert.IsTrue(compressed.Length < Encoding.UTF8.GetBytes(input).Length);
+            Assert.IsLessThan(Encoding.UTF8.GetBytes(input).Length, compressed.Length);
         }
 
         [TestMethod]
@@ -179,7 +179,7 @@ namespace McNNTP.Tests
             Assert.IsTrue("anything".MatchesWildmat(""));
             Assert.IsTrue("test".MatchesWildmat(null));
             
-            Assert.ThrowsException<ArgumentNullException>(() => 
+            Assert.ThrowsExactly<ArgumentNullException>(() => 
                 string.Empty.MatchesWildmat("pattern"));
         }
 
