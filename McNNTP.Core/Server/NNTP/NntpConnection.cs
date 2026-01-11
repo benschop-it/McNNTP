@@ -427,7 +427,11 @@ namespace McNNTP.Core.Server.NNTP
         /// <returns>A value indicating whether or not the transmission was successful.</returns>
         private async Task<bool> Send([NotNull][StringSyntax(StringSyntaxAttribute.CompositeFormat)] string format, [NotNull] params object[] args)
         {
-            return await this.SendInternal(string.Format(CultureInfo.InvariantCulture, format, args), false, CancellationToken.None);
+            string data = (args != null && args.Length > 0)
+                ? string.Format(CultureInfo.InvariantCulture, format, args)
+                : format;
+
+            return await this.SendInternal(data, false, CancellationToken.None);
         }
 
         /// <summary>
