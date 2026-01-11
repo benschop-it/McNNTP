@@ -1874,6 +1874,11 @@ namespace McNNTP.Core.Server.NNTP
         private async Task<CommandProcessingResult> NewGroups(string content)
         {
             var parts = content.TrimEnd('\r', '\n').Split(' ');
+            if (parts.Length < 2)
+            {
+                await this.Send("501 Syntax Error\r\n");
+                return new CommandProcessingResult(true);
+            }
 
             var dateTime = string.Join(" ", parts.ElementAt(1), parts.ElementAt(2));
             DateTime afterDate;
@@ -2214,8 +2219,16 @@ namespace McNNTP.Core.Server.NNTP
                 try
                 {
                     Article article;
-                    if (!Data.Article.TryParse(prev.Message == null ? msg.Substring(0, msg.Length - 5) : prev.Message + msg.Substring(0, msg.Length - 3), out article))
-                    {
+                    string? parsableMsg;
+                    if (prev == null || prev.Message == null) {
+                        parsableMsg = msg!.Substring(0, msg.Length - 5);
+                    } else if (prev.Message != null) {
+                        parsableMsg = prev.Message + msg!.Substring(0, msg.Length - 3);
+                    } else {
+                        parsableMsg = msg!.Substring(0, msg.Length - 3);
+                    }
+
+                    if (!Data.Article.TryParse(parsableMsg, out article)) {
                         await this.Send("441 Posting failed\r\n");
                         return new CommandProcessingResult(true, true);
                     }
@@ -2367,11 +2380,19 @@ namespace McNNTP.Core.Server.NNTP
                 }
             }
 
-            return new CommandProcessingResult(true, false)
-            {
-                MessageHandler = this.PostMessageAccumulator,
-                Message = prev == null ? msg : prev.Message == null ? msg : prev.Message + "\r\n" + msg,
-            };
+            var result = new CommandProcessingResult(true, false) { MessageHandler = this.PostMessageAccumulator };
+
+            if (prev == null) {
+                result.Message = msg;
+            } else if (prev.Message == null) {
+                result.Message = msg;
+            } else if (!prev.Message.EndsWith("\r\n")) {
+                result.Message = prev.Message + "\r\n" + msg;
+            } else {
+                result.Message = prev.Message + msg;
+            }
+
+            return result;
         }
 
         /// <summary>
