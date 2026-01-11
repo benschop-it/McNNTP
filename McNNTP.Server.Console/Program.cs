@@ -272,6 +272,8 @@ namespace McNNTP.Server.Console
                             CanInject = false
                         };
 
+                        admin.SetPassword(pass);
+
                         using (var session = SessionUtility.OpenSession())
                         {
                             session.Save(admin);
@@ -279,7 +281,6 @@ namespace McNNTP.Server.Console
                             session.Close();
                         }
 
-                        admin.SetPassword(pass);
                         Console.WriteLine("User {0} created with all privileges.", name);
                         _logger?.LogInformation("User {UserName} created with all privileges", name);
                         break;

@@ -1,5 +1,5 @@
-﻿  ARTICLE [message-ID|number]
-  AUTHINFO USER name|PASS password|GENERIC program [argument ...]
+﻿  AUTHINFO USER name|PASS password|GENERIC program [argument ...]
+  ARTICLE [message-ID|number]
   BODY [message-ID|number]
   CAPABILITIES
   DATE
