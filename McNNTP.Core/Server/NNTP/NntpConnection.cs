@@ -572,38 +572,37 @@ namespace McNNTP.Core.Server.NNTP
         }
 
         private async Task HandleCompletedPostDataAsync(byte[] postBytes, CancellationToken ct) {
-            // postBytes is headers+body WITHOUT the final terminator, but still dot-stuffed.
-            // Split headers/body, then dot-UNstuff body.
-            Article article;
+            Article? article = null;
+            string? messageIdForCleanup = null;
 
             try {
                 var (headersText, bodyBytesDotStuffed) = SplitHeadersAndBody(postBytes);
                 var bodyBytes = DotUnstuffBodyBytes(bodyBytesDotStuffed);
 
                 article = BuildArticleFromHeaders(headersText);
+                messageIdForCleanup = article.MessageId;
 
-                // Preview for moderation logic
-                article.Body = GetBodyPreviewAscii(bodyBytes, maxBytes: 8);
+                // Preview for moderation logic (needs >= 9 bytes to match "APPROVE\r\n")
+                article.Body = GetBodyPreviewAscii(bodyBytes, maxBytes: 32);
 
-                // persist body bytes before DB commit
+                // Persist body bytes before DB commit (OK as long as we cleanup on failure)
                 await PersistBodyBytesAsync(article.MessageId, bodyBytes, ct);
 
-                // Your existing POST code below can stay mostly the same, but you must NOT depend on article.Body anymore.
                 article.ArticleNewsgroups = new HashSet<ArticleNewsgroup>();
                 article.Path = this.PathHost;
 
-                using (var session = Database.SessionUtility.OpenSession()) {
+                using (var session = Database.SessionUtility.OpenSession())
+                using (var tx = session.BeginTransaction()) {
                     session.Save(article);
 
                     foreach (var newsgroupName in article.Newsgroups.Split(' ')) {
                         bool canApprove;
-                        if (this.Identity == null) {
+                        if (this.Identity == null)
                             canApprove = false;
-                        } else if (this.Identity.CanInject || this.Identity.CanApproveAny) {
+                        else if (this.Identity.CanInject || this.Identity.CanApproveAny)
                             canApprove = true;
-                        } else {
+                        else
                             canApprove = this.Identity.Moderates.Any(ng => ng.Name == newsgroupName);
-                        }
 
                         if (!canApprove) {
                             article.Approved = null;
@@ -616,14 +615,14 @@ namespace McNNTP.Core.Server.NNTP
                         }
 
                         if (this.Identity != null && !this.Identity.CanInject) {
-                            article.InjectionDate = DateTime.UtcNow.ToString("dd MMM yyyy HH:mm:ss") + " +0000";
-                            article.ChangeHeader("Injection-Date", DateTime.UtcNow.ToString("dd MMM yyyy HH:mm:ss") + " +0000");
+                            var now = DateTime.UtcNow;
+                            article.InjectionDate = now.ToString("dd MMM yyyy HH:mm:ss") + " +0000";
+                            article.ChangeHeader("Injection-Date", now.ToString("dd MMM yyyy HH:mm:ss") + " +0000");
                             article.InjectionInfo = null;
                             article.RemoveHeader("Injection-Info");
                             article.Xref = null;
                             article.RemoveHeader("Xref");
 
-                            // RFC 5536 3.2.6. The Followup-To header field SHOULD NOT appear in a message, unless its content is different from the content of the Newsgroups header field.
                             if (!string.IsNullOrWhiteSpace(article.FollowupTo) &&
                                 string.Compare(article.FollowupTo, article.Newsgroups, StringComparison.OrdinalIgnoreCase) == 0) {
                                 article.FollowupTo = null;
@@ -636,19 +635,14 @@ namespace McNNTP.Core.Server.NNTP
                             (article.Control != null && this.Identity != null && article.Control.StartsWith("rmgroup ", StringComparison.OrdinalIgnoreCase) && !this.Identity.CanDeleteCatalogs) ||
                             (article.Control != null && this.Identity != null && article.Control.StartsWith("checkgroups ", StringComparison.OrdinalIgnoreCase) && !this.Identity.CanCheckCatalogs)) {
                             await this.Send("480 Permission to issue control message denied\r\n");
-
-                            // Abort the whole POST handling
-                            session.Clear(); // optional; mainly ensure no pending state
-                                             // If you already wrote body file earlier, delete it here (best-effort)
                             TryDeleteBodyFile(article.MessageId);
-
-                            return; // <-- replaces old return CommandProcessingResult(...)
+                            tx.Rollback();
+                            return;
                         }
 
-                        // Moderation - if this is a moderator's approval message, don't post it, but approve the referenced message.
                         if (canApprove && !string.IsNullOrEmpty(article.References) &&
                             (article.Body.StartsWith("APPROVE\r\n", StringComparison.OrdinalIgnoreCase) ||
-                                article.Body.StartsWith("APPROVED\r\n", StringComparison.OrdinalIgnoreCase))) {
+                             article.Body.StartsWith("APPROVED\r\n", StringComparison.OrdinalIgnoreCase))) {
                             var references = article.References.Split(' ');
 
                             var target = session.CreateQuery("from ArticleNewsgroup an where an.Article.MessageId IN (:ReferencesList) AND an.Newsgroup.Name = :NewsgroupName")
@@ -658,58 +652,56 @@ namespace McNNTP.Core.Server.NNTP
                                 .SingleOrDefault();
 
                             if (target != null) {
-                                target.Article.Approved = this.Identity.Mailbox ?? string.Format("{0}@{1}", this.Identity.Username, this.server.PathHost);
+                                target.Article.Approved = this.Identity!.Mailbox ?? string.Format("{0}@{1}", this.Identity.Username, this.server.PathHost);
                                 session.SaveOrUpdate(target.Article);
 
                                 target.Pending = false;
                                 session.SaveOrUpdate(target);
-                                session.Flush();
-                                session.Close();
 
+                                tx.Commit();
                                 await this.Send("240 Article received OK\r\n");
 
-                                // If you had already persisted the body file for the approval message,
-                                // you probably want to delete it because you are NOT posting this message.
+                                // Not posting this message; delete its body file
                                 TryDeleteBodyFile(article.MessageId);
-
                                 return;
                             }
                         }
 
-                        var newsgroupNameClosure = newsgroupName;
-                        // We don't add metagroups here, you can't 'post' directly to a meta group.
-                        var newsgroup = session.Query<Newsgroup>().SingleOrDefault(n => n.Name == newsgroupNameClosure);
+                        var newsgroup = session.Query<Newsgroup>().SingleOrDefault(n => n.Name == newsgroupName);
                         if (newsgroup == null) {
-                            _logger.VerboseFormat("Cross-post of message {0} to {1} failed - newsgroup not found", article.MessageId, newsgroupNameClosure);
+                            _logger.VerboseFormat("Cross-post of message {0} to {1} failed - newsgroup not found", article.MessageId, newsgroupName);
                             continue;
                         }
 
                         if (newsgroup.DenyLocalPosting) {
-                            _logger.VerboseFormat("Cross-post of message {0} to {1} failed - local posting denied", article.MessageId, newsgroupNameClosure);
+                            _logger.VerboseFormat("Cross-post of message {0} to {1} failed - local posting denied", article.MessageId, newsgroupName);
                             continue;
                         }
 
-                        var articleNewsgroup = new ArticleNewsgroup {
+                        var nextNumber = session.CreateQuery("select max(an.Number) from ArticleNewsgroup an where an.Newsgroup.Name = :NewsgroupName")
+                            .SetParameter("NewsgroupName", newsgroupName)
+                            .UniqueResult<int>() + 1;
+
+                        session.Save(new ArticleNewsgroup {
                             Article = article,
                             Cancelled = false,
                             Newsgroup = newsgroup,
-                            Number = session.CreateQuery("select max(an.Number) from ArticleNewsgroup an where an.Newsgroup.Name = :NewsgroupName").SetParameter("NewsgroupName", newsgroupName).UniqueResult<int>() + 1,
+                            Number = nextNumber,
                             Pending = newsgroup.Moderated && !canApprove,
-                        };
-                        session.Save(articleNewsgroup);
+                        });
 
-                        if (article.Control != null) {
+                        if (article.Control != null)
                             this.HandleControlMessage(newsgroup, article);
-                        }
                     }
 
-                    session.Flush();
-                    session.Close();
+                    tx.Commit();
                 }
 
                 await this.Send("240 Article received OK\r\n");
             } catch (Exception ex) {
                 _logger.LogError(ex, "Exception when trying to handle POST post-data");
+                if (!string.IsNullOrEmpty(messageIdForCleanup))
+                    TryDeleteBodyFile(messageIdForCleanup);
                 await this.Send("441 Posting failed\r\n");
             }
         }
