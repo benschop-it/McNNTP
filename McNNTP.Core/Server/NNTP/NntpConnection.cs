@@ -11,6 +11,7 @@ namespace McNNTP.Core.Server.NNTP
 {
     using System;
     using System.Collections.Generic;
+    using System.Configuration;
     using System.Diagnostics;
     using System.Diagnostics.CodeAnalysis;
     using System.Diagnostics.Contracts;
@@ -28,6 +29,7 @@ namespace McNNTP.Core.Server.NNTP
     using Microsoft.Extensions.Logging;
     using MoreLinq;
     using NHibernate;
+    using NHibernate.Cfg;
     using NHibernate.Criterion;
     using NHibernate.Linq;
     using NHibernate.Transform;
@@ -142,6 +144,48 @@ namespace McNNTP.Core.Server.NNTP
                     { "XOVER", async (c, data) => await c.XOver(data) },
                     { "XPAT", async (c, data) => await c.XPAT(data) },
                 };
+        }
+
+        private enum ReadMode {
+            Command,
+            PostData
+        }
+
+        private ReadMode _mode = ReadMode.Command;
+
+        // Holds bytes that were read but not yet processed (command lines, post data, etc.)
+        private readonly List<byte> _rx = new();
+
+        // For post-data accumulation across reads (includes headers+body, excludes final terminator once found)
+        private readonly List<byte> _postData = new();
+
+        private static readonly byte[] CrLf = [(byte)'\r', (byte)'\n'];
+        private static readonly byte[] CrLfCrLf = [(byte)'\r', (byte)'\n', (byte)'\r', (byte)'\n'];
+        private static readonly byte[] PostTerminator = [(byte)'\r', (byte)'\n', (byte)'.', (byte)'\r', (byte)'\n'];
+
+        private static int IndexOfSequence(List<byte> haystack, byte[] needle, int startIndex = 0) {
+            if (needle.Length == 0) return startIndex;
+            for (var i = startIndex; i <= haystack.Count - needle.Length; i++) {
+                var match = true;
+                for (var j = 0; j < needle.Length; j++) {
+                    if (haystack[i + j] != needle[j]) { match = false; break; }
+                }
+                if (match) return i;
+            }
+            return -1;
+        }
+
+        private static byte[] TakeAndRemoveRange(List<byte> list, int count) {
+            var arr = list.GetRange(0, count).ToArray();
+            list.RemoveRange(0, count);
+            return arr;
+        }
+
+        private async Task<bool> SendRawAsync(byte[] data, CancellationToken ct = default) {
+            try {
+                await this.stream.WriteAsync(data, ct);
+                return true;
+            } catch (IOException) { return false; } catch (SocketException) { return false; } catch (ObjectDisposedException) { return false; }
         }
 
         /// <summary>
@@ -267,7 +311,7 @@ namespace McNNTP.Core.Server.NNTP
         #endregion
 
         #region IO and Connection Management
-        public async void Process()
+        public async void ProcessOld()
         {
             // ReSharper disable ConvertIfStatementToConditionalTernaryExpression
             if (this.CanPost)
@@ -419,6 +463,257 @@ namespace McNNTP.Core.Server.NNTP
             }
         }
 
+        public async void Process() {
+            if (this.CanPost)
+                await this.Send("200 Service available, posting allowed\r\n");
+            else
+                await this.Send("201 Service available, posting prohibited\r\n");
+
+            Debug.Assert(this.stream != null);
+
+            var send403 = false;
+
+            try {
+                while (true) {
+                    if (!this.client.Connected || !this.client.Client.Connected)
+                        return;
+
+                    if (!this.stream.CanRead) {
+                        await this.Shutdown();
+                        return;
+                    }
+
+                    var bytesRead = await this.stream.ReadAsync(this.buffer, 0, BufferSize);
+                    if (bytesRead <= 0)
+                        return;
+
+                    // append raw bytes to rx buffer
+                    for (var i = 0; i < bytesRead; i++)
+                        _rx.Add(this.buffer[i]);
+
+                    // Process as much as possible from _rx
+                    while (true) {
+                        if (_mode == ReadMode.Command) {
+                            var idx = IndexOfSequence(_rx, CrLf);
+                            if (idx < 0)
+                                break; // need more bytes
+
+                            // Take one full line including CRLF
+                            var lineBytes = TakeAndRemoveRange(_rx, idx + CrLf.Length);
+                            var line = Encoding.ASCII.GetString(lineBytes); // commands are ASCII-ish
+
+                            if (this.ShowCommands)
+                                _logger.TraceFormat("{0}:{1} >{2}> {3}", this.RemoteAddress, this.RemotePort, this.TLS ? "!" : ">", line.TrimEnd('\r', '\n'));
+
+                            // Existing command execution flow, but now we feed a line (ending in CRLF) rather than your big content string.
+                            // IMPORTANT: in-process commands are gone; POST-data is handled via _mode instead.
+                            var command = line.Split(' ').First().TrimEnd('\r', '\n').ToUpperInvariant();
+                            if (!CommandDirectory.ContainsKey(command)) {
+                                await this.Send("500 Unknown command\r\n");
+                                continue;
+                            }
+
+                            CommandProcessingResult result;
+                            try {
+                                result = await CommandDirectory[command].Invoke(this, line);
+                            } catch (Exception ex) {
+                                send403 = true;
+                                _logger.LogError(ex, "Exception processing a command");
+                                break;
+                            }
+
+                            if (!result.IsHandled) {
+                                await this.Send("500 Unknown command\r\n");
+                                continue;
+                            }
+
+                            if (result.IsQuitting)
+                                return;
+
+                            // Switch to post-data mode if POST said so (see Post() change below)
+                            if (result.EnterPostDataMode) {
+                                _mode = ReadMode.PostData;
+                                _postData.Clear();
+                            }
+                        } else // PostData
+                          {
+                            // Find terminator \r\n.\r\n in the stream (may span chunks)
+                            var idx = IndexOfSequence(_rx, PostTerminator);
+                            if (idx < 0) {
+                                // Not complete yet: move everything to _postData and clear _rx
+                                _postData.AddRange(_rx);
+                                _rx.Clear();
+                                break;
+                            }
+
+                            // We have terminator in _rx at position idx:
+                            // 1) append bytes before terminator to postData
+                            _postData.AddRange(_rx.GetRange(0, idx));
+                            // 2) remove bytes up through terminator from rx (consume)
+                            _rx.RemoveRange(0, idx + PostTerminator.Length);
+
+                            // Process the completed post-data message now
+                            await HandleCompletedPostDataAsync(_postData.ToArray(), CancellationToken.None);
+
+                            _postData.Clear();
+                            _mode = ReadMode.Command;
+
+                            // continue loop; there may be more command bytes already in _rx
+                        }
+                    }
+
+                    if (send403)
+                        break;
+                }
+            } catch (DecoderFallbackException dfe) { send403 = true; _logger.LogError(dfe, "Decoder fallback"); } catch (IOException se) { send403 = true; _logger.LogError(se, "I/O Exception"); } catch (SocketException se) { send403 = true; _logger.LogError(se, "Socket Exception"); } catch (NotSupportedException nse) { _logger.LogError(nse, "Not supported"); return; } catch (ObjectDisposedException ode) { _logger.LogError(ode, "Disposed"); return; }
+
+            if (send403)
+                await this.Send("403 Archive server temporarily offline\r\n");
+        }
+
+        private async Task HandleCompletedPostDataAsync(byte[] postBytes, CancellationToken ct) {
+            // postBytes is headers+body WITHOUT the final terminator, but still dot-stuffed.
+            // Split headers/body, then dot-UNstuff body.
+            Article article;
+
+            try {
+                var (headersText, bodyBytesDotStuffed) = SplitHeadersAndBody(postBytes);
+                var bodyBytes = DotUnstuffBodyBytes(bodyBytesDotStuffed);
+
+                article = BuildArticleFromHeaders(headersText);
+
+                // Preview for moderation logic
+                article.Body = GetBodyPreviewAscii(bodyBytes, maxBytes: 8);
+
+                // persist body bytes before DB commit
+                await PersistBodyBytesAsync(article.MessageId, bodyBytes, ct);
+
+                // Your existing POST code below can stay mostly the same, but you must NOT depend on article.Body anymore.
+                article.ArticleNewsgroups = new HashSet<ArticleNewsgroup>();
+                article.Path = this.PathHost;
+
+                using (var session = Database.SessionUtility.OpenSession()) {
+                    session.Save(article);
+
+                    foreach (var newsgroupName in article.Newsgroups.Split(' ')) {
+                        bool canApprove;
+                        if (this.Identity == null) {
+                            canApprove = false;
+                        } else if (this.Identity.CanInject || this.Identity.CanApproveAny) {
+                            canApprove = true;
+                        } else {
+                            canApprove = this.Identity.Moderates.Any(ng => ng.Name == newsgroupName);
+                        }
+
+                        if (!canApprove) {
+                            article.Approved = null;
+                            article.RemoveHeader("Approved");
+                        }
+
+                        if (this.Identity != null && !this.Identity.CanCancel) {
+                            article.Supersedes = null;
+                            article.RemoveHeader("Supersedes");
+                        }
+
+                        if (this.Identity != null && !this.Identity.CanInject) {
+                            article.InjectionDate = DateTime.UtcNow.ToString("dd MMM yyyy HH:mm:ss") + " +0000";
+                            article.ChangeHeader("Injection-Date", DateTime.UtcNow.ToString("dd MMM yyyy HH:mm:ss") + " +0000");
+                            article.InjectionInfo = null;
+                            article.RemoveHeader("Injection-Info");
+                            article.Xref = null;
+                            article.RemoveHeader("Xref");
+
+                            // RFC 5536 3.2.6. The Followup-To header field SHOULD NOT appear in a message, unless its content is different from the content of the Newsgroups header field.
+                            if (!string.IsNullOrWhiteSpace(article.FollowupTo) &&
+                                string.Compare(article.FollowupTo, article.Newsgroups, StringComparison.OrdinalIgnoreCase) == 0) {
+                                article.FollowupTo = null;
+                            }
+                        }
+
+                        if ((article.Control != null && this.Identity == null) ||
+                            (article.Control != null && this.Identity != null && article.Control.StartsWith("cancel ", StringComparison.OrdinalIgnoreCase) && !this.Identity.CanCancel) ||
+                            (article.Control != null && this.Identity != null && article.Control.StartsWith("newgroup ", StringComparison.OrdinalIgnoreCase) && !this.Identity.CanCreateCatalogs) ||
+                            (article.Control != null && this.Identity != null && article.Control.StartsWith("rmgroup ", StringComparison.OrdinalIgnoreCase) && !this.Identity.CanDeleteCatalogs) ||
+                            (article.Control != null && this.Identity != null && article.Control.StartsWith("checkgroups ", StringComparison.OrdinalIgnoreCase) && !this.Identity.CanCheckCatalogs)) {
+                            await this.Send("480 Permission to issue control message denied\r\n");
+
+                            // Abort the whole POST handling
+                            session.Clear(); // optional; mainly ensure no pending state
+                                             // If you already wrote body file earlier, delete it here (best-effort)
+                            TryDeleteBodyFile(article.MessageId);
+
+                            return; // <-- replaces old return CommandProcessingResult(...)
+                        }
+
+                        // Moderation - if this is a moderator's approval message, don't post it, but approve the referenced message.
+                        if (canApprove && !string.IsNullOrEmpty(article.References) &&
+                            (article.Body.StartsWith("APPROVE\r\n", StringComparison.OrdinalIgnoreCase) ||
+                                article.Body.StartsWith("APPROVED\r\n", StringComparison.OrdinalIgnoreCase))) {
+                            var references = article.References.Split(' ');
+
+                            var target = session.CreateQuery("from ArticleNewsgroup an where an.Article.MessageId IN (:ReferencesList) AND an.Newsgroup.Name = :NewsgroupName")
+                                .SetParameterList("ReferencesList", references)
+                                .SetParameter("NewsgroupName", newsgroupName)
+                                .List<ArticleNewsgroup>()
+                                .SingleOrDefault();
+
+                            if (target != null) {
+                                target.Article.Approved = this.Identity.Mailbox ?? string.Format("{0}@{1}", this.Identity.Username, this.server.PathHost);
+                                session.SaveOrUpdate(target.Article);
+
+                                target.Pending = false;
+                                session.SaveOrUpdate(target);
+                                session.Flush();
+                                session.Close();
+
+                                await this.Send("240 Article received OK\r\n");
+
+                                // If you had already persisted the body file for the approval message,
+                                // you probably want to delete it because you are NOT posting this message.
+                                TryDeleteBodyFile(article.MessageId);
+
+                                return;
+                            }
+                        }
+
+                        var newsgroupNameClosure = newsgroupName;
+                        // We don't add metagroups here, you can't 'post' directly to a meta group.
+                        var newsgroup = session.Query<Newsgroup>().SingleOrDefault(n => n.Name == newsgroupNameClosure);
+                        if (newsgroup == null) {
+                            _logger.VerboseFormat("Cross-post of message {0} to {1} failed - newsgroup not found", article.MessageId, newsgroupNameClosure);
+                            continue;
+                        }
+
+                        if (newsgroup.DenyLocalPosting) {
+                            _logger.VerboseFormat("Cross-post of message {0} to {1} failed - local posting denied", article.MessageId, newsgroupNameClosure);
+                            continue;
+                        }
+
+                        var articleNewsgroup = new ArticleNewsgroup {
+                            Article = article,
+                            Cancelled = false,
+                            Newsgroup = newsgroup,
+                            Number = session.CreateQuery("select max(an.Number) from ArticleNewsgroup an where an.Newsgroup.Name = :NewsgroupName").SetParameter("NewsgroupName", newsgroupName).UniqueResult<int>() + 1,
+                            Pending = newsgroup.Moderated && !canApprove,
+                        };
+                        session.Save(articleNewsgroup);
+
+                        if (article.Control != null) {
+                            this.HandleControlMessage(newsgroup, article);
+                        }
+                    }
+
+                    session.Flush();
+                    session.Close();
+                }
+
+                await this.Send("240 Article received OK\r\n");
+            } catch (Exception ex) {
+                _logger.LogError(ex, "Exception when trying to handle POST post-data");
+                await this.Send("441 Posting failed\r\n");
+            }
+        }
+
         /// <summary>
         /// Sends the formatted data to the client.
         /// </summary>
@@ -562,7 +857,7 @@ namespace McNNTP.Core.Server.NNTP
 
             using (var session = Database.SessionUtility.OpenSession())
             {
-                ArticleNewsgroup articleNewsgroup;
+                ArticleNewsgroup? articleNewsgroup;
                 int type;
                 if (string.IsNullOrEmpty(param))
                 {
@@ -660,7 +955,12 @@ namespace McNNTP.Core.Server.NNTP
                     }
 
                     await this.Send(articleNewsgroup.Article.Headers + "\r\n\r\n");
-                    await this.Send(articleNewsgroup.Article.Body + "\r\n.\r\n");
+
+                    var bodyBytes = await LoadBodyBytesAsync(articleNewsgroup.Article.MessageId, CancellationToken.None);
+                    var stuffed = DotStuffBodyBytes(bodyBytes);
+
+                    await SendRawAsync(stuffed, CancellationToken.None);
+                    await SendRawAsync(PostTerminator, CancellationToken.None); // "\r\n.\r\n"
                 }
             }
 
@@ -708,7 +1008,7 @@ namespace McNNTP.Core.Server.NNTP
                 var rng = RandomNumberGenerator.Create();
                 rng.GetNonZeroBytes(saltBytes);
 
-                User admin;
+                User? admin;
                 using (var session = Database.SessionUtility.OpenSession())
                 {
                     admin = session.Query<User>().Fetch(a => a.Moderates).SingleOrDefault(a => a.Username == this.Username);
@@ -789,7 +1089,7 @@ namespace McNNTP.Core.Server.NNTP
             using (var session = Database.SessionUtility.OpenSession())
             {
                 int type;
-                ArticleNewsgroup articleNewsgroup;
+                ArticleNewsgroup? articleNewsgroup;
                 if (string.IsNullOrEmpty(param))
                 {
                     if (this.CurrentNewsgroup == null)
@@ -884,7 +1184,16 @@ namespace McNNTP.Core.Server.NNTP
                             break;
                     }
 
-                    await this.Send(articleNewsgroup.Article.Body + "\r\n.\r\n");
+                    var settingsFolder = ApplicationSettings.SettingsFolder; // This returns the configured settings folder path.
+                    var location = ArticleBodyPath.GetBodyFilePath(settingsFolder, articleNewsgroup.Article.MessageId);
+                    ArticleBodyPath.EnsureDirectoryForFile(location);
+
+                    var bodyBytes = await LoadBodyBytesAsync(articleNewsgroup.Article.MessageId, CancellationToken.None);
+                    var stuffed = DotStuffBodyBytes(bodyBytes);
+
+                    // Send body bytes raw, then NNTP terminator
+                    await SendRawAsync(stuffed);
+                    await SendRawAsync(PostTerminator);
                 }
             }
 
@@ -945,7 +1254,7 @@ namespace McNNTP.Core.Server.NNTP
         private async Task<CommandProcessingResult> Group(string content)
         {
             content = content.TrimEnd('\r', '\n').Substring(content.IndexOf(' ') + 1).Split(' ')[0];
-            Newsgroup ng;
+            Newsgroup? ng;
             using (var session = Database.SessionUtility.OpenSession())
             {
                 ng = session.Query<Newsgroup>().AddMetagroups(session, this.Identity).SingleOrDefault(n => n.Name == content);
@@ -2195,208 +2504,17 @@ namespace McNNTP.Core.Server.NNTP
         /// </summary>
         /// <returns>A command processing result specifying the command is handled.</returns>
         /// <remarks>See <a href="http://tools.ietf.org/html/rfc3977#section-6.3.1">RFC 3977</a> for more information.</remarks>
-        private async Task<CommandProcessingResult> Post()
-        {
-            if (!this.CanPost)
-            {
+        private async Task<CommandProcessingResult> Post() {
+            if (!this.CanPost) {
                 await this.Send("440 Posting not permitted\r\n");
                 return new CommandProcessingResult(true);
             }
 
             await this.Send("340 Send article to be posted\r\n");
 
-            return await this.PostMessageAccumulator(null, null);
-        }
-
-        private async Task<CommandProcessingResult> PostMessageAccumulator(string? msg, CommandProcessingResult? prev)
-        {
-            if (
-
-                // Message ends naturally
-                (msg != null && msg.EndsWith("\r\n.\r\n", StringComparison.OrdinalIgnoreCase)) ||
-
-                // Message delimiter comes in second batch
-                (prev != null && prev.Message != null && prev.Message.EndsWith("\r\n", StringComparison.OrdinalIgnoreCase) && msg != null && msg.EndsWith(".\r\n", StringComparison.OrdinalIgnoreCase)))
-            {
-                bool send441;
-
-                try
-                {
-                    Article article;
-                    string? parsableMsg;
-                    if (prev == null || prev.Message == null) {
-                        parsableMsg = msg!.Substring(0, msg.Length - 5);
-                    } else if (prev.Message != null) {
-                        parsableMsg = prev.Message + msg!.Substring(0, msg.Length - 3);
-                    } else {
-                        parsableMsg = msg!.Substring(0, msg.Length - 3);
-                    }
-
-                    if (!Data.Article.TryParse(parsableMsg, out article)) {
-                        await this.Send("441 Posting failed\r\n");
-                        return new CommandProcessingResult(true, true);
-                    }
-
-                    article.ArticleNewsgroups = new HashSet<ArticleNewsgroup>();
-                    article.Path = this.PathHost;
-
-                    using (var session = Database.SessionUtility.OpenSession())
-                    {
-                        session.Save(article);
-
-                        foreach (var newsgroupName in article.Newsgroups.Split(' '))
-                        {
-                            bool canApprove;
-                            if (this.Identity == null)
-                            {
-                                canApprove = false;
-                            }
-                            else if (this.Identity.CanInject || this.Identity.CanApproveAny)
-                            {
-                                canApprove = true;
-                            }
-                            else
-                            {
-                                canApprove = this.Identity.Moderates.Any(ng => ng.Name == newsgroupName);
-                            }
-
-                            if (!canApprove)
-                            {
-                                article.Approved = null;
-                                article.RemoveHeader("Approved");
-                            }
-
-                            if (this.Identity != null && !this.Identity.CanCancel)
-                            {
-                                article.Supersedes = null;
-                                article.RemoveHeader("Supersedes");
-                            }
-
-                            if (this.Identity != null && !this.Identity.CanInject)
-                            {
-                                article.InjectionDate = DateTime.UtcNow.ToString("dd MMM yyyy HH:mm:ss") + " +0000";
-                                article.ChangeHeader("Injection-Date", DateTime.UtcNow.ToString("dd MMM yyyy HH:mm:ss") + " +0000");
-                                article.InjectionInfo = null;
-                                article.RemoveHeader("Injection-Info");
-                                article.Xref = null;
-                                article.RemoveHeader("Xref");
-
-                                // RFC 5536 3.2.6. The Followup-To header field SHOULD NOT appear in a message, unless its content is different from the content of the Newsgroups header field.
-                                if (!string.IsNullOrWhiteSpace(article.FollowupTo) &&
-                                    string.Compare(article.FollowupTo, article.Newsgroups, StringComparison.OrdinalIgnoreCase) == 0)
-                                {
-                                    article.FollowupTo = null;
-                                }
-                            }
-
-                            if ((article.Control != null && this.Identity == null) ||
-                                (article.Control != null && this.Identity != null && article.Control.StartsWith("cancel ", StringComparison.OrdinalIgnoreCase) && !this.Identity.CanCancel) ||
-                                (article.Control != null && this.Identity != null && article.Control.StartsWith("newgroup ", StringComparison.OrdinalIgnoreCase) && !this.Identity.CanCreateCatalogs) ||
-                                (article.Control != null && this.Identity != null && article.Control.StartsWith("rmgroup ", StringComparison.OrdinalIgnoreCase) && !this.Identity.CanDeleteCatalogs) ||
-                                (article.Control != null && this.Identity != null && article.Control.StartsWith("checkgroups ", StringComparison.OrdinalIgnoreCase) && !this.Identity.CanCheckCatalogs))
-                            {
-                                await this.Send("480 Permission to issue control message denied\r\n");
-                                return new CommandProcessingResult(true, true);
-                            }
-
-                            // Moderation - if this is a moderator's approval message, don't post it, but approve the referenced message.
-                            if (canApprove && !string.IsNullOrEmpty(article.References) &&
-                                (article.Body.StartsWith("APPROVE\r\n", StringComparison.OrdinalIgnoreCase) ||
-                                    article.Body.StartsWith("APPROVED\r\n", StringComparison.OrdinalIgnoreCase)))
-                            {
-                                var references = article.References.Split(' ');
-
-                                var target = session.CreateQuery("from ArticleNewsgroup an where an.Article.MessageId IN (:ReferencesList) AND an.Newsgroup.Name = :NewsgroupName")
-                                    .SetParameterList("ReferencesList", references)
-                                    .SetParameter("NewsgroupName", newsgroupName)
-                                    .List<ArticleNewsgroup>()
-                                    .SingleOrDefault();
-
-                                if (target != null)
-                                {
-                                    target.Article.Approved = this.Identity.Mailbox ?? string.Format("{0}@{1}", this.Identity.Username, this.server.PathHost);
-                                    session.SaveOrUpdate(target.Article);
-
-                                    target.Pending = false;
-                                    session.SaveOrUpdate(target);
-                                    session.Flush();
-                                    session.Close();
-
-                                    await this.Send("240 Article received OK\r\n");
-                                    return new CommandProcessingResult(true, true)
-                                    {
-                                        Message = prev.Message + msg,
-                                    };
-                                }
-                            }
-
-                            var newsgroupNameClosure = newsgroupName;
-                            // We don't add metagroups here, you can't 'post' directly to a meta group.
-                            var newsgroup = session.Query<Newsgroup>().SingleOrDefault(n => n.Name == newsgroupNameClosure);
-                            if (newsgroup == null)
-                            {
-                                _logger.VerboseFormat("Cross-post of message {0} to {1} failed - newsgroup not found", article.MessageId, newsgroupNameClosure);
-                                continue;
-                            }
-
-                            if (newsgroup.DenyLocalPosting)
-                            {
-                                _logger.VerboseFormat("Cross-post of message {0} to {1} failed - local posting denied", article.MessageId, newsgroupNameClosure);
-                                continue;
-                            }
-
-                            var articleNewsgroup = new ArticleNewsgroup
-                            {
-                                Article = article,
-                                Cancelled = false,
-                                Newsgroup = newsgroup,
-                                Number = session.CreateQuery("select max(an.Number) from ArticleNewsgroup an where an.Newsgroup.Name = :NewsgroupName").SetParameter("NewsgroupName", newsgroupName).UniqueResult<int>() + 1,
-                                Pending = newsgroup.Moderated && !canApprove,
-                            };
-                            session.Save(articleNewsgroup);
-
-                            if (article.Control != null)
-                            {
-                                this.HandleControlMessage(newsgroup, article);
-                            }
-                        }
-
-                        session.Flush();
-                        session.Close();
-                    }
-
-                    await this.Send("240 Article received OK\r\n");
-                    return new CommandProcessingResult(true, true)
-                    {
-                        Message = prev.Message + msg,
-                    };
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Exception when trying to handle POST");
-                    send441 = true;
-                }
-
-                if (send441)
-                {
-                    await this.Send("441 Posting failed\r\n");
-                    return new CommandProcessingResult(true);
-                }
-            }
-
-            var result = new CommandProcessingResult(true, false) { MessageHandler = this.PostMessageAccumulator };
-
-            if (prev == null) {
-                result.Message = msg;
-            } else if (prev.Message == null) {
-                result.Message = msg;
-            } else if (!prev.Message.EndsWith("\r\n")) {
-                result.Message = prev.Message + "\r\n" + msg;
-            } else {
-                result.Message = prev.Message + msg;
-            }
-
-            return result;
+            return new CommandProcessingResult(true) {
+                EnterPostDataMode = true
+            };
         }
 
         /// <summary>
@@ -2732,91 +2850,70 @@ namespace McNNTP.Core.Server.NNTP
                     {
                         ng = session.Query<Newsgroup>().AddMetagroups(session, this.Identity).SingleOrDefault(n => n.Name == this.CurrentNewsgroup);
 
-                        if (string.IsNullOrEmpty(rangeExpression))
-                        {
-                            if (this.CurrentNewsgroup.EndsWith(".deleted"))
-                            {
-                                articleNewsgroups = session.Query<ArticleNewsgroup>()
-                                    .Where(an => an.Newsgroup.Name == ng.Name.Substring(0, ng.Name.Length - 8) && an.Cancelled)
-                                    .OrderBy(an => an.Number)
-                                    .ToList();
-                            }
-                            else if (this.CurrentNewsgroup.EndsWith(".pending"))
-                            {
-                                articleNewsgroups = session.Query<ArticleNewsgroup>()
-                                    .Where(an => an.Newsgroup.Name == ng.Name.Substring(0, ng.Name.Length - 8) && an.Pending)
-                                    .OrderBy(an => an.Number)
-                                    .ToList();
-                            }
-                            else
-                            {
-                                articleNewsgroups = session.Query<ArticleNewsgroup>()
-                                    .Where(an => an.Newsgroup.Name == ng.Name && !an.Cancelled && !an.Pending)
-                                    .OrderBy(an => an.Number)
-                                    .ToList();
-                            }
-                        }
-                        else
-                        {
-                            var range = ParseRange(rangeExpression);
-                            if (range == null || range.Equals(default(Tuple<int, int?>)))
-                            {
-                                await this.Send("501 Syntax Error\r\n");
-                                return new CommandProcessingResult(true);
-                            }
+                        if (ng != null) {
+                            if (string.IsNullOrEmpty(rangeExpression)) {
+                                if (this.CurrentNewsgroup.EndsWith(".deleted")) {
+                                    articleNewsgroups = session.Query<ArticleNewsgroup>()
+                                        .Where(an => an.Newsgroup.Name == ng.Name.Substring(0, ng.Name.Length - 8) && an.Cancelled)
+                                        .OrderBy(an => an.Number)
+                                        .ToList();
+                                } else if (this.CurrentNewsgroup.EndsWith(".pending")) {
+                                    articleNewsgroups = session.Query<ArticleNewsgroup>()
+                                        .Where(an => an.Newsgroup.Name == ng.Name.Substring(0, ng.Name.Length - 8) && an.Pending)
+                                        .OrderBy(an => an.Number)
+                                        .ToList();
+                                } else {
+                                    articleNewsgroups = session.Query<ArticleNewsgroup>()
+                                        .Where(an => an.Newsgroup.Name == ng.Name && !an.Cancelled && !an.Pending)
+                                        .OrderBy(an => an.Number)
+                                        .ToList();
+                                }
+                            } else {
+                                var range = ParseRange(rangeExpression);
+                                if (range == null || range.Equals(default(Tuple<int, int?>))) {
+                                    await this.Send("501 Syntax Error\r\n");
+                                    return new CommandProcessingResult(true);
+                                }
 
-                            if (!range.Item2.HasValue)
-                            {
-                                // LOW -
-                                if (this.CurrentNewsgroup.EndsWith(".deleted"))
-                                {
-                                    articleNewsgroups = session.Query<ArticleNewsgroup>()
-                                        .Where(an => an.Newsgroup.Name == ng.Name.Substring(0, ng.Name.Length - 8) && an.Cancelled && an.Number >= range.Item1)
-                                        .OrderBy(an => an.Number)
-                                        .ToList();
-                                }
-                                else if (this.CurrentNewsgroup.EndsWith(".pending"))
-                                {
-                                    articleNewsgroups = session.Query<ArticleNewsgroup>()
-                                        .Where(an => an.Newsgroup.Name == ng.Name.Substring(0, ng.Name.Length - 8) && an.Pending && an.Number >= range.Item1)
-                                        .OrderBy(an => an.Number)
-                                        .ToList();
-                                }
-                                else
-                                {
-                                    articleNewsgroups = session.Query<ArticleNewsgroup>()
-                                        .Where(an => an.Newsgroup.Name == ng.Name && !an.Cancelled && !an.Pending && an.Number >= range.Item1)
-                                        .OrderBy(an => an.Number)
-                                        .ToList();
-                                }
-                            }
-                            else
-                            {
-                                // LOW-HIGH
-                                if (this.CurrentNewsgroup.EndsWith(".deleted"))
-                                {
-                                    articleNewsgroups = session.Query<ArticleNewsgroup>()
-                                        .Where(an => an.Newsgroup.Name == ng.Name.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Cancelled && an.Number >= range.Item1 && an.Number <= range.Item2.Value)
-                                        .OrderBy(an => an.Number)
-                                        .ToList();
-                                }
-                                else if (this.CurrentNewsgroup.EndsWith(".deleted"))
-                                {
-                                    articleNewsgroups = session.Query<ArticleNewsgroup>()
-                                        .Where(an => an.Newsgroup.Name == ng.Name.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Pending && an.Number >= range.Item1 && an.Number <= range.Item2.Value)
-                                        .OrderBy(an => an.Number)
-                                        .ToList();
-                                }
-                                else
-                                {
-                                    articleNewsgroups = session.Query<ArticleNewsgroup>()
-                                        .Where(an => an.Newsgroup.Name == ng.Name && !an.Cancelled && !an.Pending && an.Number >= range.Item1 && an.Number <= range.Item2.Value)
-                                        .OrderBy(an => an.Number)
-                                        .ToList();
+                                if (!range.Item2.HasValue) {
+                                    // LOW -
+                                    if (this.CurrentNewsgroup.EndsWith(".deleted")) {
+                                        articleNewsgroups = session.Query<ArticleNewsgroup>()
+                                            .Where(an => an.Newsgroup.Name == ng.Name.Substring(0, ng.Name.Length - 8) && an.Cancelled && an.Number >= range.Item1)
+                                            .OrderBy(an => an.Number)
+                                            .ToList();
+                                    } else if (this.CurrentNewsgroup.EndsWith(".pending")) {
+                                        articleNewsgroups = session.Query<ArticleNewsgroup>()
+                                            .Where(an => an.Newsgroup.Name == ng.Name.Substring(0, ng.Name.Length - 8) && an.Pending && an.Number >= range.Item1)
+                                            .OrderBy(an => an.Number)
+                                            .ToList();
+                                    } else {
+                                        articleNewsgroups = session.Query<ArticleNewsgroup>()
+                                            .Where(an => an.Newsgroup.Name == ng.Name && !an.Cancelled && !an.Pending && an.Number >= range.Item1)
+                                            .OrderBy(an => an.Number)
+                                            .ToList();
+                                    }
+                                } else {
+                                    // LOW-HIGH
+                                    if (this.CurrentNewsgroup.EndsWith(".deleted")) {
+                                        articleNewsgroups = session.Query<ArticleNewsgroup>()
+                                            .Where(an => an.Newsgroup.Name == ng.Name.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Cancelled && an.Number >= range.Item1 && an.Number <= range.Item2.Value)
+                                            .OrderBy(an => an.Number)
+                                            .ToList();
+                                    } else if (this.CurrentNewsgroup.EndsWith(".deleted")) {
+                                        articleNewsgroups = session.Query<ArticleNewsgroup>()
+                                            .Where(an => an.Newsgroup.Name == ng.Name.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Pending && an.Number >= range.Item1 && an.Number <= range.Item2.Value)
+                                            .OrderBy(an => an.Number)
+                                            .ToList();
+                                    } else {
+                                        articleNewsgroups = session.Query<ArticleNewsgroup>()
+                                            .Where(an => an.Newsgroup.Name == ng.Name && !an.Cancelled && !an.Pending && an.Number >= range.Item1 && an.Number <= range.Item2.Value)
+                                            .OrderBy(an => an.Number)
+                                            .ToList();
+                                    }
                                 }
                             }
                         }
-
                         session.Close();
                     }
                 }
@@ -3158,5 +3255,188 @@ namespace McNNTP.Core.Server.NNTP
 
             return new Tuple<int, int?>(low, high);
         }
+
+        private static byte[] DotUnstuffBodyBytes(byte[] body) {
+            // NNTP dot transparency: if a line begins with ".." it represents a leading "."
+            // Applies at start of body and right after CRLF.
+            var output = new List<byte>(body.Length);
+
+            var i = 0;
+            var atLineStart = true;
+
+            while (i < body.Length) {
+                if (atLineStart && body[i] == (byte)'.') {
+                    // If we have ".." at line start, drop one dot
+                    if (i + 1 < body.Length && body[i + 1] == (byte)'.') {
+                        output.Add((byte)'.');
+                        i += 2;
+                    } else {
+                        // Single dot at line start is kept (not a terminator here; terminator already stripped)
+                        output.Add((byte)'.');
+                        i += 1;
+                    }
+                } else {
+                    output.Add(body[i]);
+                    i++;
+                }
+
+                // Update atLineStart when we just wrote CRLF
+                var outCount = output.Count;
+                atLineStart = outCount >= 2 &&
+                              output[outCount - 2] == (byte)'\r' &&
+                              output[outCount - 1] == (byte)'\n';
+            }
+
+            return output.ToArray();
+        }
+
+        private static byte[] DotStuffBodyBytes(byte[] body) {
+            // When sending: any line that starts with '.' must be sent as '..'
+            var output = new List<byte>(body.Length + 64);
+
+            var i = 0;
+            var atLineStart = true;
+
+            while (i < body.Length) {
+                if (atLineStart && body[i] == (byte)'.') {
+                    output.Add((byte)'.'); // add extra dot
+                }
+
+                output.Add(body[i]);
+                i++;
+
+                var outCount = output.Count;
+                atLineStart = outCount >= 2 &&
+                              output[outCount - 2] == (byte)'\r' &&
+                              output[outCount - 1] == (byte)'\n';
+            }
+
+            return output.ToArray();
+        }
+
+        private static (string HeadersText, byte[] BodyBytes) SplitHeadersAndBody(byte[] messageBytes) {
+            // messageBytes contains headers + "\r\n\r\n" + body
+            var list = messageBytes.ToList();
+            var idx = IndexOfSequence(list, CrLfCrLf);
+            if (idx < 0)
+                throw new InvalidOperationException("POST data missing header/body delimiter (CRLFCRLF).");
+
+            var headersBytes = list.GetRange(0, idx).ToArray();
+            var bodyBytes = list.GetRange(idx + CrLfCrLf.Length, list.Count - (idx + CrLfCrLf.Length)).ToArray();
+
+            // RFC-wise headers are 7-bit; practically many clients are UTF-8. Use UTF8 but do not throw.
+            var headersText = Encoding.UTF8.GetString(headersBytes);
+
+            return (headersText, bodyBytes);
+        }
+
+        private static Article BuildArticleFromHeaders(string headersText) {
+            if (!Data.Article.TryParseHeaders(headersText, out var headers, out _))
+                throw new InvalidOperationException("Header parse failed.");
+
+            if (!headers.TryGetValue("FROM", out var fromValue) || string.IsNullOrWhiteSpace(fromValue))
+                throw new InvalidOperationException("Missing From header.");
+
+            if (!headers.ContainsKey("NEWSGROUPS"))
+                throw new InvalidOperationException("Missing Newsgroups header.");
+
+            if (!headers.ContainsKey("SUBJECT"))
+                throw new InvalidOperationException("Missing Subject header.");
+
+            // Message-ID handling matching your Article.TryParse logic
+            string msgId;
+            if (headers.TryGetValue("MESSAGE-ID", out var messageIdValue)) {
+                msgId = messageIdValue;
+                if (!msgId.IsUsenetMessageId())
+                    msgId = "<" + Guid.NewGuid().ToString("N").ToUpperInvariant() + "@mcnttp.invalid>";
+            } else {
+                msgId = "<" + Guid.NewGuid().ToString("N").ToUpperInvariant() + "@mcnttp.auto>";
+            }
+
+            // Reconstruct Headers property as stored in DB (original code uses block.Substring(0, headerLength - 2))
+            // Here we store exactly the header block text as received (no trailing CRLFCRLF).
+            var article = new Article {
+                Approved = headers.Where(h => string.Equals(h.Key, "APPROVED", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                Archive = headers.Where(h => string.Equals(h.Key, "ARCHIVE", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                Body = "", // IMPORTANT
+                ContentDisposition = headers.Where(h => string.Equals(h.Key, "CONTENT-DISPOSITION", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                ContentLanguage = headers.Where(h => string.Equals(h.Key, "CONTENT-LANGUAGE", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                ContentTransferEncoding = headers.Where(h => string.Equals(h.Key, "CONTENT-TRANSFER-ENCODING", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                ContentType = headers.Where(h => string.Equals(h.Key, "CONTENT-TYPE", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                Control = headers.Where(h => string.Equals(h.Key, "CONTROL", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value.Trim()).SingleOrDefault(),
+                Date = headers.Where(h => string.Equals(h.Key, "DATE", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value.Trim()).SingleOrDefault()
+                       ?? DateTime.UtcNow.ToString("dd MMM yyyy HH:mm:ss") + " +0000",
+                Distribution = headers.Where(h => string.Equals(h.Key, "DISTRIBUTION", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                Expires = headers.Where(h => string.Equals(h.Key, "EXPIRES", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                FollowupTo = headers.Where(h => string.Equals(h.Key, "FOLLOWUP-TO", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                From = headers.Single(h => string.Equals(h.Key, "FROM", StringComparison.OrdinalIgnoreCase)).Value,
+                Headers = headersText,
+                InjectionDate = headers.Where(h => string.Equals(h.Key, "INJECTION-DATE", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                MessageId = msgId,
+                MIMEVersion = headers.Where(h => string.Equals(h.Key, "MIME-VERSION", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                Newsgroups = headers.Single(h => string.Equals(h.Key, "NEWSGROUPS", StringComparison.OrdinalIgnoreCase)).Value,
+                Organization = headers.Where(h => string.Equals(h.Key, "ORGANIZATION", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                References = headers.Where(h => string.Equals(h.Key, "REFERENCES", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                Subject = headers.Single(h => string.Equals(h.Key, "SUBJECT", StringComparison.OrdinalIgnoreCase)).Value,
+                Summary = headers.Where(h => string.Equals(h.Key, "SUMMARY", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                Supersedes = headers.Where(h => string.Equals(h.Key, "SUPERSEDES", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                UserAgent = headers.Where(h => string.Equals(h.Key, "USER-AGENT", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+                Xref = headers.Where(h => string.Equals(h.Key, "XREF", StringComparison.OrdinalIgnoreCase)).Select(h => h.Value).SingleOrDefault(),
+            };
+
+            if (!headers.ContainsKey("DATE"))
+                article.ChangeHeader("Date", article.Date);
+
+            if (article.Date.TryParseNewsgroupDateHeader(out var parsed))
+                article.DateTimeParsed = parsed.ToUniversalTime();
+
+            article.ChangeHeader("Message-ID", msgId);
+
+            return article;
+        }
+
+        private static async Task PersistBodyBytesAsync(string messageId, byte[] bodyBytes, CancellationToken ct) {
+            var baseFolder = ApplicationSettings.SettingsFolder;
+            var path = ArticleBodyPath.GetBodyFilePath(baseFolder, messageId);
+
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir))
+                Directory.CreateDirectory(dir);
+
+            await File.WriteAllBytesAsync(path, bodyBytes, ct);
+        }
+
+        private static async Task<byte[]> LoadBodyBytesAsync(string messageId, CancellationToken ct) {
+            var baseFolder = ApplicationSettings.SettingsFolder;
+            var path = ArticleBodyPath.GetBodyFilePath(baseFolder, messageId);
+            return File.Exists(path) ? await File.ReadAllBytesAsync(path, ct) : Array.Empty<byte>();
+        }
+
+        private static string GetBodyPreviewAscii(byte[] bodyBytes, int maxBytes) {
+            var len = Math.Min(maxBytes, bodyBytes.Length);
+            if (len <= 0) return string.Empty;
+
+            // Only allow ASCII printable + CR/LF/TAB. Replace others with '?'.
+            Span<char> chars = stackalloc char[len];
+            for (var i = 0; i < len; i++) {
+                var b = bodyBytes[i];
+                chars[i] = b switch {
+                    9 or 10 or 13 => (char)b,              // \t \n \r
+                    >= 32 and <= 126 => (char)b,           // printable ASCII
+                    _ => '?'
+                };
+            }
+
+            return new string(chars);
+        }
+
+        private static void TryDeleteBodyFile(string messageId) {
+            try {
+                var path = ArticleBodyPath.GetBodyFilePath(ApplicationSettings.SettingsFolder, messageId);
+                if (File.Exists(path)) File.Delete(path);
+            } catch { /* best effort */ }
+        }
+
+
     }
 }

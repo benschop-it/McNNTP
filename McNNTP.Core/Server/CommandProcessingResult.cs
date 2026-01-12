@@ -7,6 +7,7 @@
         public bool IsHandled { get; set; }
 
         public bool IsQuitting { get; set; }
+        public bool EnterPostDataMode { get; set; }
 
         /// <summary>
         /// Gets or sets a value that, if not null, indicates the request was the
