@@ -30,6 +30,8 @@ namespace McNNTP.Server.Console
     using McNNTP.Server.Console.Configuration;
 
     using NHibernate.Linq;
+    using Serilog;
+    using Serilog.Events;
 
     /// <summary>
     /// A console host for the NNTP server process
@@ -86,8 +88,76 @@ namespace McNNTP.Server.Console
 
             try
             {
+                // Build configuration early so Serilog can read settings (and so we can adapt file path)
+                var environment = Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") ?? "Production";
+                var configuration = new ConfigurationBuilder()
+                    .SetBasePath(Directory.GetCurrentDirectory())
+                    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+                    .AddJsonFile($"appsettings.{environment}.json", optional: true, reloadOnChange: true)
+                    .AddEnvironmentVariables()
+                    .Build();
+
+                // Determine file sink parameters from configuration (fall back to sensible defaults)
+                var filePath = configuration["Logging:File:Path"] ?? "logs/mcnntp-.log";
+                var maxFileSizeBytesStr = configuration["Logging:File:MaxFileSizeBytes"];
+                var maxRollingFilesStr = configuration["Logging:File:MaxRollingFiles"];
+                var minLevelStr = configuration["Logging:File:MinLevel"];
+
+                long.TryParse(maxFileSizeBytesStr, out var maxFileSizeBytes);
+                if (maxFileSizeBytes <= 0) maxFileSizeBytes = 50 * 1024 * 1024; // default 50MB
+
+                int.TryParse(maxRollingFilesStr, out var retainedCount);
+                if (retainedCount <= 0) retainedCount = 10;
+
+                // If user provided a plain filename like "McNTTP.ERROR.log", adapt it to Serilog rolling pattern "name-.log"
+                if (Path.GetExtension(filePath).Equals(".log", StringComparison.OrdinalIgnoreCase) && !filePath.Contains("-."))
+                {
+                    var dir = Path.GetDirectoryName(filePath);
+                    var fileName = Path.GetFileNameWithoutExtension(filePath);
+                    filePath = Path.Combine(string.IsNullOrEmpty(dir) ? "." : dir, fileName + "-.log");
+                }
+
+                // Ensure directory exists
+                try
+                {
+                    var dirName = Path.GetDirectoryName(filePath);
+                    if (!string.IsNullOrEmpty(dirName))
+                    {
+                        Directory.CreateDirectory(dirName);
+                    }
+                }
+                catch
+                {
+                    // ignore; Serilog will surface I/O errors when writing
+                }
+
+                // Minimum level for file sink
+                var fileMinLevel = LogEventLevel.Warning;
+                if (!string.IsNullOrWhiteSpace(minLevelStr) && Enum.TryParse<LogEventLevel>(minLevelStr, true, out var parsedLevel))
+                {
+                    fileMinLevel = parsedLevel;
+                }
+
+                // Build logger
+                Log.Logger = new LoggerConfiguration()
+                    .MinimumLevel.Debug()
+                    .Enrich.FromLogContext()
+                    .WriteTo.Console() // console sink
+                    .WriteTo.File(
+                        path: filePath,
+                        rollingInterval: RollingInterval.Day,
+                        retainedFileCountLimit: retainedCount,
+                        fileSizeLimitBytes: maxFileSizeBytes,
+                        rollOnFileSizeLimit: true,
+                        restrictedToMinimumLevel: fileMinLevel,
+                        outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj}{NewLine}{Exception}")
+                    .ReadFrom.Configuration(configuration) // allow overrides from Serilog section if present
+                    .CreateLogger();
+
+                Log.Information("Starting host");
+
                 var host = CreateHostBuilder(args).Build();
-                
+
                 using var scope = host.Services.CreateScope();
                 var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
                 var mcnntpSettings = scope.ServiceProvider.GetRequiredService<IOptions<McNNTPSettings>>().Value;
@@ -177,6 +247,10 @@ namespace McNNTP.Server.Console
                 Console.ReadLine();
                 return -1;
             }
+            finally
+            {
+                Log.CloseAndFlush();
+            }
         }
 
         /// <summary>
@@ -199,6 +273,7 @@ namespace McNNTP.Server.Console
                     services.Configure<McNNTPSettings>(
                         context.Configuration.GetSection(McNNTPSettings.SectionName));
                 })
+                .UseSerilog() // replace Microsoft logging with Serilog so framework logs are captured
                 .ConfigureLogging((context, logging) =>
                 {
                     logging.ClearProviders();
