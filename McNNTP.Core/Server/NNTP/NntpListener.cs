@@ -22,6 +22,7 @@
             this.server = server;
             this._logger = logger;
             this._loggerFactory = loggerFactory;
+            _logger.LogInformation("NNTP Listener created on {endpoint}", localEp);
         }
 
         public PortClass PortType { get; set; }

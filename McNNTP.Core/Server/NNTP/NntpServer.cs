@@ -66,6 +66,8 @@ namespace McNNTP.Core.Server.NNTP
             this._loggerFactory = loggerFactory;
             this.AllowStartTLS = true;
             this.ShowData = true;
+            this.ShowBytes = true;
+            this.ShowCommands = true;
         }
 
         /// <summary>

@@ -1,107 +1,85 @@
 ﻿using System;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 
-namespace McNNTP.Common {
+namespace McNNTP.Common;
+
 #nullable enable
-    public static class ArticleBodyPath {
-        /// <summary>
-        /// Returns the full file path where the article body should be stored.
-        /// Layout:
-        ///   {baseFolder}\{enc(firstChar)}\{enc(secondChar)}\{enc(fullKey)}.body
-        ///
-        /// "fullKey" is the part before '@' (and without angle brackets).
-        /// Encoding is lowercase-only but preserves original case.
-        /// </summary>
-        public static string GetBodyFilePath(string baseFolder, string fullMessageId) {
-            if (string.IsNullOrWhiteSpace(baseFolder))
-                throw new ArgumentException("Base folder is required.", nameof(baseFolder));
 
-            if (string.IsNullOrWhiteSpace(fullMessageId))
-                throw new ArgumentException("MessageId is required.", nameof(fullMessageId));
+public static class ArticleBodyPath {
+    /// <summary>
+    /// Builds a 2-level folder layout from the message-id key:
+    ///   {baseFolder}\{enc(firstChar)}\{enc(secondChar)}\{key}
+    ///
+    /// Where:
+    /// - key = part before '@' with surrounding angle brackets removed
+    /// - enc(lowercase/digit) = itself
+    /// - enc(uppercase) = lowercase letter repeated twice (e.g. 'D' -> "dd")
+    ///
+    /// Note: folder names are derived from single characters, so variable-length
+    /// encoding (1 or 2 chars) is unambiguous.
+    /// </summary>
+    public static string GetBodyFilePath(string baseFolder, string fullMessageId) {
+        if (string.IsNullOrWhiteSpace(baseFolder))
+            throw new ArgumentException("Base folder is required.", nameof(baseFolder));
+        if (string.IsNullOrWhiteSpace(fullMessageId))
+            throw new ArgumentException("Message-Id is required.", nameof(fullMessageId));
 
-            var key = ExtractKeyBeforeAt(fullMessageId);
+        var key = ExtractKey(fullMessageId);
 
-            if (key.Length < 2)
-                throw new ArgumentException(
-                    $"MessageId key part is too short: '{key}'",
-                    nameof(fullMessageId));
+        // If message-id key is too short, still keep deterministic structure.
+        var c1 = key.Length >= 1 ? key[0] : '_';
+        var c2 = key.Length >= 2 ? key[1] : '_';
 
-            var l1 = EncodeChar(key[0]);
-            var l2 = EncodeChar(key[1]);
+        var p1 = EncodeCharForFolder(c1);
+        var p2 = EncodeCharForFolder(c2);
 
-            var fileName = EncodeKey(key) + ".body";
+        return Path.Combine(baseFolder, p1, p2, key);
+    }
 
-            return Path.Combine(baseFolder, l1, l2, fileName);
+    private static string ExtractKey(string fullMessageId) {
+        // Typical: <key@domain>
+        var s = fullMessageId.Trim();
+
+        if (s.Length >= 2 && s[0] == '<' && s[^1] == '>')
+            s = s.Substring(1, s.Length - 2);
+
+        var at = s.IndexOf('@');
+        var key = at >= 0 ? s.Substring(0, at) : s;
+
+        if (string.IsNullOrWhiteSpace(key))
+            throw new FormatException($"Invalid Message-Id: '{fullMessageId}'");
+
+        // The user said it's [0-9a-zA-Z] random strings.
+        // Still guard against path separators just in case.
+        if (key.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            throw new FormatException($"Message-Id key contains invalid filename characters: '{key}'");
+
+        return key;
+    }
+
+    private static string EncodeCharForFolder(char c) {
+        // digits stay digits
+        if (c is >= '0' and <= '9')
+            return c.ToString();
+
+        // lowercase a-z stays lowercase
+        if (c is >= 'a' and <= 'z')
+            return c.ToString();
+
+        // uppercase A-Z becomes doubled lowercase, e.g. 'D' => "dd"
+        if (c is >= 'A' and <= 'Z') {
+            var lower = (char)(c - 'A' + 'a');
+            return string.Create(2, lower, static (span, ch) => { span[0] = ch; span[1] = ch; });
         }
 
-        /// <summary>
-        /// Ensures the directory exists for the file path returned by GetBodyFilePath.
-        /// </summary>
-        public static void EnsureDirectoryForFile(string filePath) {
-            var dir = Path.GetDirectoryName(filePath);
-            if (string.IsNullOrWhiteSpace(dir))
-                throw new InvalidOperationException("Could not determine directory name from path.");
+        // Fallback (shouldn't happen with your stated charset): make it stable + readable.
+        // Example: '_' => "_", '-' => "-", etc.
+        if (c is '_' or '-' or '.')
+            return c.ToString();
 
-            Directory.CreateDirectory(dir);
-        }
-
-        /// <summary>
-        /// Extracts the part before '@' from typical NNTP message-id formats:
-        ///   &lt;key@domain&gt;
-        ///   key@domain
-        ///   &lt;key&gt;   (no domain)
-        /// </summary>
-        private static string ExtractKeyBeforeAt(string fullMessageId) {
-            var s = fullMessageId.Trim();
-
-            // strip angle brackets if present
-            if (s.Length >= 2 && s[0] == '<' && s[^1] == '>')
-                s = s.Substring(1, s.Length - 2);
-
-            var at = s.IndexOf('@');
-            return at >= 0 ? s[..at] : s;
-        }
-
-        /// <summary>
-        /// Encodes one character into a two-character, lowercase-only token.
-        /// digit: d0..d9
-        /// lower: la..lz
-        /// upper: ua..uz  (case preserved by prefix)
-        /// </summary>
-        private static string EncodeChar(char c) {
-            return c switch {
-                >= '0' and <= '9' => "d" + c,
-                >= 'a' and <= 'z' => "l" + c,
-                >= 'A' and <= 'Z' => "u" + char.ToLowerInvariant(c),
-                _ => throw new ArgumentException(
-                    $"Unsupported character '{c}'. Expected [0-9a-zA-Z].",
-                    nameof(c))
-            };
-        }
-
-        /// <summary>
-        /// Encodes the whole key by concatenating EncodeChar for each character.
-        /// </summary>
-        private static string EncodeKey(string key) {
-            return string.Create(key.Length * 2, key, static (span, state) => {
-                var j = 0;
-                foreach (var c in state) {
-                    if (c >= '0' && c <= '9') {
-                        span[j++] = 'd';
-                        span[j++] = c;
-                    } else if (c >= 'a' && c <= 'z') {
-                        span[j++] = 'l';
-                        span[j++] = c;
-                    } else if (c >= 'A' && c <= 'Z') {
-                        span[j++] = 'u';
-                        span[j++] = char.ToLowerInvariant(c);
-                    } else {
-                        throw new ArgumentException(
-                            $"Unsupported character '{c}'. Expected [0-9a-zA-Z].",
-                            nameof(key));
-                    }
-                }
-            });
-        }
+        // Last-resort: hex
+        return $"x{(int)c:X4}";
     }
 }
