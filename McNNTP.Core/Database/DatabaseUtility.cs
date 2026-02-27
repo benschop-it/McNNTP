@@ -254,14 +254,25 @@ namespace McNNTP.Core.Database
         public static Configuration CreateConfiguration()
         {
             var configuration = new Configuration();
-            
-            // Configure properties programmatically
+
+            // Configure SQLite connection with performance optimizations
+            var connectionString = "Data Source=news.db;Pooling=true;FailIfMissing=false;Version=3;" +
+                                 "Journal Mode=WAL;" +  // Write-Ahead Logging for better concurrency
+                                 "Synchronous=NORMAL;" + // Balance between safety and performance
+                                 "Cache Size=10000;" +   // 10MB cache
+                                 "Page Size=4096;" +     // Optimal page size
+                                 "Temp Store=MEMORY";    // Use memory for temporary storage
+
             configuration.SetProperty("connection.driver_class", "NHibernate.Driver.SQLite20Driver");
-            configuration.SetProperty("connection.connection_string", "Data Source=news.db;Pooling=true;FailIfMissing=false;Version=3");
+            configuration.SetProperty("connection.connection_string", connectionString);
             configuration.SetProperty("dialect", "NHibernate.Dialect.SQLiteDialect");
             configuration.SetProperty("query.substitutions", "true=1;false=0");
             configuration.SetProperty("show_sql", "false");
-            
+
+            // Connection pooling settings
+            configuration.SetProperty("connection.pool_size", "20");
+            configuration.SetProperty("connection.release_mode", "on_close");
+
             return configuration;
         }
     }

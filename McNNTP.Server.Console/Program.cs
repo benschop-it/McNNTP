@@ -189,6 +189,19 @@ namespace McNNTP.Server.Console
                         DatabaseUtility.RebuildSchema();
                     }
                 }
+
+                // Create performance indexes for optimal query performance
+                logger.LogInformation("Creating/verifying database performance indexes...");
+                try
+                {
+                    McNNTP.Core.Database.DatabaseIndexes.CreatePerformanceIndexes(loggerFactory.CreateLogger("DatabaseIndexes"));
+                    McNNTP.Core.Database.DatabaseIndexes.AnalyzeDatabase(loggerFactory.CreateLogger("DatabaseIndexes"));
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Failed to create some indexes, continuing anyway");
+                }
+
                 _nntpServer = new NntpServer(nntpServerLogger, loggerFactory)
                 {
                     AllowPosting = true,

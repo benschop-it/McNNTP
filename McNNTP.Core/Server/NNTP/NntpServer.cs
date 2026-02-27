@@ -25,6 +25,7 @@ namespace McNNTP.Core.Server.NNTP
     using Microsoft.Extensions.Logging;
 
     using McNNTP.Common;
+    using McNNTP.Core.Server.Cache;
 
     /// <summary>
     /// Defines the an NNTP server utility that provides connection management and command handling to expose
@@ -58,6 +59,11 @@ namespace McNNTP.Core.Server.NNTP
         private readonly List<NntpConnection> connections = new List<NntpConnection>();
 
         /// <summary>
+        /// Cache for frequently accessed articles and newsgroups
+        /// </summary>
+        private readonly ArticleCache _cache;
+
+        /// <summary>
         /// Initializes a new instance of the <see cref="NntpServer"/> class.
         /// </summary>
         public NntpServer([NotNull] ILogger<NntpServer> logger, [NotNull] ILoggerFactory loggerFactory)
@@ -66,6 +72,7 @@ namespace McNNTP.Core.Server.NNTP
             this._loggerFactory = loggerFactory;
             this.AllowStartTLS = true;
             this.ShowData = true;
+            this._cache = new ArticleCache();
         }
 
         /// <summary>
@@ -126,6 +133,11 @@ namespace McNNTP.Core.Server.NNTP
         /// Gets or sets a value indicating whether the actual bytes (data) transmitted are logged to the logging instance.
         /// </summary>
         public bool ShowData { get; set; }
+
+        /// <summary>
+        /// Gets the article cache for this server instance.
+        /// </summary>
+        internal ArticleCache Cache => _cache;
 
         /// <summary>
         /// Gets the X.509 server certificate this instance presents to clients
@@ -258,6 +270,9 @@ namespace McNNTP.Core.Server.NNTP
 
             _cancellationTokenSource?.Dispose();
             _cancellationTokenSource = null;
+
+            // Dispose cache
+            _cache?.Dispose();
         }
 
         internal void AddConnection([NotNull] NntpConnection nntpConnection)

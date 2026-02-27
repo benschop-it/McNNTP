@@ -27,6 +27,20 @@ namespace McNNTP.Core.Database
         private static readonly Lazy<ISessionFactory> SessionFactory = new Lazy<ISessionFactory>(() =>
         {
             var configuration = DatabaseUtility.CreateConfiguration();
+
+            // Enable second-level cache for performance
+            configuration.SetProperty("cache.use_second_level_cache", "true");
+            configuration.SetProperty("cache.provider_class", "NHibernate.Cache.HashtableCacheProvider");
+
+            // Enable query cache
+            configuration.SetProperty("cache.use_query_cache", "true");
+
+            // Optimize batch size for bulk operations
+            configuration.SetProperty("adonet.batch_size", "50");
+
+            // Prepare SQL at startup
+            configuration.SetProperty("prepare_sql", "true");
+
             configuration.AddAssembly(typeof(Newsgroup).Assembly);
 
             return configuration.BuildSessionFactory();
@@ -38,5 +52,13 @@ namespace McNNTP.Core.Database
         /// <returns>A new session from the NHibernate session factory.</returns>
         [Pure]
         public static ISession OpenSession() => SessionFactory.Value.OpenSession();
+
+        /// <summary>
+        /// Builds a new stateless session for high-performance read operations.
+        /// Stateless sessions are faster but don't support lazy loading or caching.
+        /// </summary>
+        /// <returns>A new stateless session from the NHibernate session factory.</returns>
+        [Pure]
+        public static IStatelessSession OpenStatelessSession() => SessionFactory.Value.OpenStatelessSession();
     }
 }
