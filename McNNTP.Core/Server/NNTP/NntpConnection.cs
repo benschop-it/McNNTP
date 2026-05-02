@@ -560,108 +560,89 @@ namespace McNNTP.Core.Server.NNTP
                 return new CommandProcessingResult(true);
             }
 
-            using (var session = Database.SessionUtility.OpenSession())
+            ArticleNewsgroup? articleNewsgroup;
+            int type;
+            if (string.IsNullOrEmpty(param))
             {
-                ArticleNewsgroup articleNewsgroup;
-                int type;
-                if (string.IsNullOrEmpty(param))
+                if (this.CurrentNewsgroup == null)
                 {
-                    if (this.CurrentNewsgroup == null)
-                    {
-                        await this.Send("412 No newsgroup selected\r\n");
-                        return new CommandProcessingResult(true);
-                    }
-
-                    if (this.CurrentNewsgroup.EndsWith(".deleted"))
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => an.Cancelled && an.Newsgroup.Name == this.CurrentNewsgroup.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Number == this.CurrentArticleNumber);
-                    }
-                    else if (this.CurrentNewsgroup.EndsWith(".pending"))
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Number == this.CurrentArticleNumber);
-                    }
-                    else
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => !an.Cancelled && !an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup && an.Number == this.CurrentArticleNumber);
-                    }
-
-                    type = 3;
+                    await this.Send("412 No newsgroup selected\r\n");
+                    return new CommandProcessingResult(true);
                 }
-                else if (param.StartsWith("<", StringComparison.Ordinal))
+
+                articleNewsgroup = await ArticleRetriever.GetArticleByNumberAsync(
+                    this.CurrentNewsgroup,
+                    this.CurrentArticleNumber!.Value,
+                    this.CurrentNewsgroup.EndsWith(".deleted"),
+                    this.CurrentNewsgroup.EndsWith(".pending"),
+                    this.server.Cache);
+                type = 3;
+            }
+            else if (param.StartsWith("<", StringComparison.Ordinal))
+            {
+                articleNewsgroup = await ArticleRetriever.GetArticleByMessageIdAsync(param, this.server.Cache);
+                type = 1;
+            }
+            else
+            {
+                int articleNumber;
+                if (!int.TryParse(param, out articleNumber))
                 {
-                    articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => an.Article.MessageId == param);
-                    type = 1;
+                    await this.Send("423 No article with that number\r\n");
+                    return new CommandProcessingResult(true);
                 }
-                else
+
+                if (this.CurrentNewsgroup == null)
                 {
-                    int articleNumber;
-                    if (!int.TryParse(param, out articleNumber))
-                    {
+                    await this.Send("412 No newsgroup selected\r\n");
+                    return new CommandProcessingResult(true);
+                }
+
+                articleNewsgroup = await ArticleRetriever.GetArticleByNumberAsync(
+                    this.CurrentNewsgroup,
+                    articleNumber,
+                    this.CurrentNewsgroup.EndsWith(".deleted"),
+                    this.CurrentNewsgroup.EndsWith(".pending"),
+                    this.server.Cache);
+                type = 2;
+            }
+
+            if (articleNewsgroup == null)
+            {
+                switch (type)
+                {
+                    case 1:
+                        await this.Send("430 No article with that message-id\r\n");
+                        break;
+                    case 2:
                         await this.Send("423 No article with that number\r\n");
-                        return new CommandProcessingResult(true);
-                    }
+                        break;
+                    case 3:
+                        await this.Send("420 Current article number is invalid\r\n");
+                        break;
 
-                    if (this.CurrentNewsgroup == null)
-                    {
-                        await this.Send("412 No newsgroup selected\r\n");
-                        return new CommandProcessingResult(true);
-                    }
-
-                    if (this.CurrentNewsgroup.EndsWith(".deleted"))
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => an.Cancelled && an.Newsgroup.Name == this.CurrentNewsgroup.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Number == articleNumber);
-                    }
-                    else if (this.CurrentNewsgroup.EndsWith(".pending"))
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Number == articleNumber);
-                    }
-                    else
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => !an.Cancelled && !an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup && an.Number == articleNumber);
-                    }
-
-                    type = 2;
                 }
-
-                session.Close();
-
-                if (articleNewsgroup == null)
+            }
+            else
+            {
+                switch (type)
                 {
-                    switch (type)
-                    {
-                        case 1:
-                            await this.Send("430 No article with that message-id\r\n");
-                            break;
-                        case 2:
-                            await this.Send("423 No article with that number\r\n");
-                            break;
-                        case 3:
-                            await this.Send("420 Current article number is invalid\r\n");
-                            break;
-
-                    }
+                    case 1:
+                        await this.Send(
+                            "220 {0} {1} Article follows (multi-line)\r\n",
+                            (!string.IsNullOrEmpty(this.CurrentNewsgroup) && string.CompareOrdinal(articleNewsgroup.Newsgroup.Name, this.CurrentNewsgroup) == 0) ? articleNewsgroup.Number : 0,
+                            articleNewsgroup.Article.MessageId);
+                        break;
+                    case 2:
+                        await this.Send("220 {0} {1} Article follows (multi-line)\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
+                        break;
+                    case 3:
+                        await this.Send("220 {0} {1} Article follows (multi-line)\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
+                        break;
                 }
-                else
-                {
-                    switch (type)
-                    {
-                        case 1:
-                            await this.Send(
-                                "220 {0} {1} Article follows (multi-line)\r\n",
-                                (!string.IsNullOrEmpty(this.CurrentNewsgroup) && string.CompareOrdinal(articleNewsgroup.Newsgroup.Name, this.CurrentNewsgroup) == 0) ? articleNewsgroup.Number : 0,
-                                articleNewsgroup.Article.MessageId);
-                            break;
-                        case 2:
-                            await this.Send("220 {0} {1} Article follows (multi-line)\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
-                            break;
-                        case 3:
-                            await this.Send("220 {0} {1} Article follows (multi-line)\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
-                            break;
-                    }
 
-                    await this.Send(articleNewsgroup.Article.Headers + "\r\n\r\n");
-                    await this.Send(articleNewsgroup.Article.Body + "\r\n.\r\n");
-                }
+                await this.Send(articleNewsgroup.Article.Headers + "\r\n\r\n");
+                await this.Send(articleNewsgroup.Article.Body + "\r\n.\r\n");
             }
 
             return new CommandProcessingResult(true);
@@ -786,106 +767,87 @@ namespace McNNTP.Core.Server.NNTP
                 }
             }
 
-            using (var session = Database.SessionUtility.OpenSession())
+            int type;
+            ArticleNewsgroup? articleNewsgroup;
+            if (string.IsNullOrEmpty(param))
             {
-                int type;
-                ArticleNewsgroup articleNewsgroup;
-                if (string.IsNullOrEmpty(param))
+                if (this.CurrentNewsgroup == null)
                 {
-                    if (this.CurrentNewsgroup == null)
-                    {
-                        await this.Send("412 No newsgroup selected\r\n");
-                        return new CommandProcessingResult(true);
-                    }
-
-                    if (this.CurrentNewsgroup.EndsWith(".deleted"))
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => an.Cancelled && an.Newsgroup.Name == this.CurrentNewsgroup.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Number == this.CurrentArticleNumber);
-                    }
-                    else if (this.CurrentNewsgroup.EndsWith(".pending"))
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Number == this.CurrentArticleNumber);
-                    }
-                    else
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => !an.Cancelled && !an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup && an.Number == this.CurrentArticleNumber);
-                    }
-
-                    type = 3;
+                    await this.Send("412 No newsgroup selected\r\n");
+                    return new CommandProcessingResult(true);
                 }
-                else if (param.StartsWith("<", StringComparison.Ordinal))
-                {
-                    articleNewsgroup = session.Query<ArticleNewsgroup>().FirstOrDefault(an => !an.Cancelled && !an.Pending && an.Article.MessageId == param);
-                    type = 1;
-                }
-                else
-                {
-                    if (this.CurrentNewsgroup == null)
-                    {
-                        await this.Send("412 No newsgroup selected\r\n");
-                        return new CommandProcessingResult(true);
-                    }
 
-                    int articleNumber;
-                    if (!int.TryParse(param, out articleNumber))
-                    {
+                articleNewsgroup = await ArticleRetriever.GetArticleByNumberAsync(
+                    this.CurrentNewsgroup,
+                    this.CurrentArticleNumber!.Value,
+                    this.CurrentNewsgroup.EndsWith(".deleted"),
+                    this.CurrentNewsgroup.EndsWith(".pending"),
+                    this.server.Cache);
+                type = 3;
+            }
+            else if (param.StartsWith("<", StringComparison.Ordinal))
+            {
+                articleNewsgroup = await ArticleRetriever.GetArticleByMessageIdAsync(param, this.server.Cache);
+                type = 1;
+            }
+            else
+            {
+                if (this.CurrentNewsgroup == null)
+                {
+                    await this.Send("412 No newsgroup selected\r\n");
+                    return new CommandProcessingResult(true);
+                }
+
+                int articleNumber;
+                if (!int.TryParse(param, out articleNumber))
+                {
+                    await this.Send("423 No article with that number\r\n");
+                    return new CommandProcessingResult(true);
+                }
+
+                articleNewsgroup = await ArticleRetriever.GetArticleByNumberAsync(
+                    this.CurrentNewsgroup,
+                    articleNumber,
+                    this.CurrentNewsgroup.EndsWith(".deleted"),
+                    this.CurrentNewsgroup.EndsWith(".pending"),
+                    this.server.Cache);
+                type = 2;
+            }
+
+            if (articleNewsgroup == null)
+            {
+                switch (type)
+                {
+                    case 1:
+                        await this.Send("430 No article with that message-id\r\n");
+                        break;
+                    case 2:
                         await this.Send("423 No article with that number\r\n");
-                        return new CommandProcessingResult(true);
-                    }
-
-                    if (this.CurrentNewsgroup.EndsWith(".deleted"))
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => an.Cancelled && an.Newsgroup.Name == this.CurrentNewsgroup.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Number == articleNumber);
-                    }
-                    else if (this.CurrentNewsgroup.EndsWith(".pending"))
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Number == articleNumber);
-                    }
-                    else
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => !an.Cancelled && !an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup && an.Number == articleNumber);
-                    }
-
-                    type = 2;
+                        break;
+                    case 3:
+                        await this.Send("420 Current article number is invalid\r\n");
+                        break;
                 }
-
-                session.Close();
-
-                if (articleNewsgroup == null)
+            }
+            else
+            {
+                switch (type)
                 {
-                    switch (type)
-                    {
-                        case 1:
-                            await this.Send("430 No article with that message-id\r\n");
-                            break;
-                        case 2:
-                            await this.Send("423 No article with that number\r\n");
-                            break;
-                        case 3:
-                            await this.Send("420 Current article number is invalid\r\n");
-                            break;
-                    }
+                    case 1:
+                        await this.Send(
+                            "222 {0} {1} Body follows (multi-line)\r\n",
+                            (!string.IsNullOrEmpty(this.CurrentNewsgroup) && string.CompareOrdinal(articleNewsgroup.Newsgroup.Name, this.CurrentNewsgroup) == 0) ? articleNewsgroup.Number : 0,
+                            articleNewsgroup.Article.MessageId);
+                        break;
+                    case 2:
+                        await this.Send("222 {0} {1} Body follows (multi-line)\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
+                        break;
+                    case 3:
+                        await this.Send("222 {0} {1} Body follows (multi-line)\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
+                        break;
                 }
-                else
-                {
-                    switch (type)
-                    {
-                        case 1:
-                            await this.Send(
-                                "222 {0} {1} Body follows (multi-line)\r\n",
-                                (!string.IsNullOrEmpty(this.CurrentNewsgroup) && string.CompareOrdinal(articleNewsgroup.Newsgroup.Name, this.CurrentNewsgroup) == 0) ? articleNewsgroup.Number : 0,
-                                articleNewsgroup.Article.MessageId);
-                            break;
-                        case 2:
-                            await this.Send("222 {0} {1} Body follows (multi-line)\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
-                            break;
-                        case 3:
-                            await this.Send("222 {0} {1} Body follows (multi-line)\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
-                            break;
-                    }
 
-                    await this.Send(articleNewsgroup.Article.Body + "\r\n.\r\n");
-                }
+                await this.Send(articleNewsgroup.Article.Body + "\r\n.\r\n");
             }
 
             return new CommandProcessingResult(true);
@@ -1203,103 +1165,84 @@ namespace McNNTP.Core.Server.NNTP
                 }
             }
 
-            using (var session = Database.SessionUtility.OpenSession())
+            ArticleNewsgroup? articleNewsgroup;
+            int type;
+            if (string.IsNullOrEmpty(param))
             {
-                ArticleNewsgroup articleNewsgroup;
-                int type;
-                if (string.IsNullOrEmpty(param))
+                if (this.CurrentNewsgroup == null)
                 {
-                    if (this.CurrentNewsgroup == null)
-                    {
-                        await this.Send("412 No newsgroup selected\r\n");
-                        return new CommandProcessingResult(true);
-                    }
-
-                    if (this.CurrentNewsgroup.EndsWith(".deleted"))
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => an.Cancelled && an.Newsgroup.Name == this.CurrentNewsgroup.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Number == this.CurrentArticleNumber);
-                    }
-                    else if (this.CurrentNewsgroup.EndsWith(".pending"))
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Number == this.CurrentArticleNumber);
-                    }
-                    else
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => !an.Cancelled && !an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup && an.Number == this.CurrentArticleNumber);
-                    }
-
-                    type = 3;
+                    await this.Send("412 No newsgroup selected\r\n");
+                    return new CommandProcessingResult(true);
                 }
-                else if (param.StartsWith("<", StringComparison.Ordinal))
-                {
-                    articleNewsgroup = session.Query<ArticleNewsgroup>().FirstOrDefault(an => an.Article.MessageId == param);
-                    type = 1;
-                }
-                else
-                {
-                    if (this.CurrentNewsgroup == null)
-                    {
-                        await this.Send("412 No newsgroup selected\r\n");
-                        return new CommandProcessingResult(true);
-                    }
 
-                    int articleNumber;
-                    if (!int.TryParse(param, out articleNumber))
-                    {
+                articleNewsgroup = await ArticleRetriever.GetArticleByNumberAsync(
+                    this.CurrentNewsgroup,
+                    this.CurrentArticleNumber!.Value,
+                    this.CurrentNewsgroup.EndsWith(".deleted"),
+                    this.CurrentNewsgroup.EndsWith(".pending"),
+                    this.server.Cache);
+                type = 3;
+            }
+            else if (param.StartsWith("<", StringComparison.Ordinal))
+            {
+                articleNewsgroup = await ArticleRetriever.GetArticleByMessageIdAsync(param, this.server.Cache);
+                type = 1;
+            }
+            else
+            {
+                if (this.CurrentNewsgroup == null)
+                {
+                    await this.Send("412 No newsgroup selected\r\n");
+                    return new CommandProcessingResult(true);
+                }
+
+                int articleNumber;
+                if (!int.TryParse(param, out articleNumber))
+                {
+                    await this.Send("423 No article with that number\r\n");
+                    return new CommandProcessingResult(true);
+                }
+
+                articleNewsgroup = await ArticleRetriever.GetArticleByNumberAsync(
+                    this.CurrentNewsgroup,
+                    articleNumber,
+                    this.CurrentNewsgroup.EndsWith(".deleted"),
+                    this.CurrentNewsgroup.EndsWith(".pending"),
+                    this.server.Cache);
+                type = 2;
+            }
+
+            if (articleNewsgroup == null)
+            {
+                switch (type)
+                {
+                    case 1:
+                        await this.Send("430 No article with that message-id\r\n");
+                        break;
+                    case 2:
                         await this.Send("423 No article with that number\r\n");
-                        return new CommandProcessingResult(true);
-                    }
-
-                    if (this.CurrentNewsgroup.EndsWith(".deleted"))
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => an.Cancelled && an.Newsgroup.Name == this.CurrentNewsgroup.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Number == articleNumber);
-                    }
-                    else if (this.CurrentNewsgroup.EndsWith(".pending"))
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup.Substring(0, this.CurrentNewsgroup.Length - 8) && an.Number == articleNumber);
-                    }
-                    else
-                    {
-                        articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => !an.Cancelled && !an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup && an.Number == articleNumber);
-                    }
-
-                    type = 2;
+                        break;
+                    case 3:
+                        await this.Send("420 Current article number is invalid\r\n");
+                        break;
                 }
-
-                session.Close();
-
-                if (articleNewsgroup == null)
+            }
+            else
+            {
+                switch (type)
                 {
-                    switch (type)
-                    {
-                        case 1:
-                            await this.Send("430 No article with that message-id\r\n");
-                            break;
-                        case 2:
-                            await this.Send("423 No article with that number\r\n");
-                            break;
-                        case 3:
-                            await this.Send("420 Current article number is invalid\r\n");
-                            break;
-                    }
+                    case 1:
+                        await this.Send("221 {0} {1} Headers follow (multi-line)\r\n", string.CompareOrdinal(articleNewsgroup.Newsgroup.Name, this.CurrentNewsgroup) == 0 ? articleNewsgroup.Number : 0, articleNewsgroup.Article.MessageId);
+                        break;
+                    case 2:
+                        await this.Send("221 {0} {1} Headers follow (multi-line)\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
+                        break;
+                    case 3:
+                        await this.Send("221 {0} {1} Headers follow (multi-line)\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
+                        break;
                 }
-                else
-                {
-                    switch (type)
-                    {
-                        case 1:
-                            await this.Send("221 {0} {1} Headers follow (multi-line)\r\n", string.CompareOrdinal(articleNewsgroup.Newsgroup.Name, this.CurrentNewsgroup) == 0 ? articleNewsgroup.Number : 0, articleNewsgroup.Article.MessageId);
-                            break;
-                        case 2:
-                            await this.Send("221 {0} {1} Headers follow (multi-line)\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
-                            break;
-                        case 3:
-                            await this.Send("221 {0} {1} Headers follow (multi-line)\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
-                            break;
-                    }
 
-                    await this.Send(articleNewsgroup.Article.Headers + "\r\n.\r\n");
-                }
+                await this.Send(articleNewsgroup.Article.Headers + "\r\n.\r\n");
             }
 
             return new CommandProcessingResult(true);
@@ -2452,67 +2395,72 @@ namespace McNNTP.Core.Server.NNTP
                 }
             }
 
-            using (var session = Database.SessionUtility.OpenSession())
+            ArticleNewsgroup? articleNewsgroup;
+            int type;
+            if (string.IsNullOrEmpty(param))
             {
-                ArticleNewsgroup articleNewsgroup;
-                int type;
-                if (string.IsNullOrEmpty(param))
+                articleNewsgroup = await ArticleRetriever.GetArticleByNumberAsync(
+                    this.CurrentNewsgroup!,
+                    this.CurrentArticleNumber!.Value,
+                    false,
+                    false,
+                    this.server.Cache);
+                type = 3;
+            }
+            else if (param.StartsWith("<", StringComparison.Ordinal))
+            {
+                articleNewsgroup = await ArticleRetriever.GetArticleByMessageIdAsync(param, this.server.Cache);
+                type = 1;
+            }
+            else
+            {
+                int articleNumber;
+                if (!int.TryParse(param, out articleNumber))
                 {
-                    articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => !an.Cancelled && !an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup && an.Number == this.CurrentArticleNumber);
-                    type = 3;
+                    await this.Send("423 No article with that number\r\n");
+                    return new CommandProcessingResult(true);
                 }
-                else if (param.StartsWith("<", StringComparison.Ordinal))
+
+                articleNewsgroup = await ArticleRetriever.GetArticleByNumberAsync(
+                    this.CurrentNewsgroup!,
+                    articleNumber,
+                    false,
+                    false,
+                    this.server.Cache);
+                type = 2;
+            }
+
+            if (articleNewsgroup == null)
+            {
+                switch (type)
                 {
-                    articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => !an.Cancelled && !an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup && an.Article.MessageId == param);
-                    type = 1;
-                }
-                else
-                {
-                    int articleNumber;
-                    if (!int.TryParse(param, out articleNumber))
-                    {
+                    case 1:
+                        await this.Send("430 No article with that message-id\r\n");
+                        break;
+                    case 2:
                         await this.Send("423 No article with that number\r\n");
-                        return new CommandProcessingResult(true);
-                    }
-
-                    articleNewsgroup = session.Query<ArticleNewsgroup>().SingleOrDefault(an => !an.Cancelled && !an.Pending && an.Newsgroup.Name == this.CurrentNewsgroup && an.Number == articleNumber);
-                    type = 2;
+                        break;
+                    case 3:
+                        await this.Send("420 Current article number is invalid\r\n");
+                        break;
                 }
-
-                session.Close();
-
-                if (articleNewsgroup == null)
+            }
+            else
+            {
+                switch (type)
                 {
-                    switch (type)
-                    {
-                        case 1:
-                            await this.Send("430 No article with that message-id\r\n");
-                            break;
-                        case 2:
-                            await this.Send("423 No article with that number\r\n");
-                            break;
-                        case 3:
-                            await this.Send("420 Current article number is invalid\r\n");
-                            break;
-                    }
-                }
-                else
-                {
-                    switch (type)
-                    {
-                        case 1:
-                            await this.Send(
-                                "223 {0} {1}\r\n",
-                                (!string.IsNullOrEmpty(this.CurrentNewsgroup) && string.CompareOrdinal(articleNewsgroup.Newsgroup.Name, this.CurrentNewsgroup) == 0) ? articleNewsgroup.Number : 0,
-                                articleNewsgroup.Article.MessageId);
-                            break;
-                        case 2:
-                            await this.Send("223 {0} {1}\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
-                            break;
-                        case 3:
-                            await this.Send("223 {0} {1}\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
-                            break;
-                    }
+                    case 1:
+                        await this.Send(
+                            "223 {0} {1}\r\n",
+                            (!string.IsNullOrEmpty(this.CurrentNewsgroup) && string.CompareOrdinal(articleNewsgroup.Newsgroup.Name, this.CurrentNewsgroup) == 0) ? articleNewsgroup.Number : 0,
+                            articleNewsgroup.Article.MessageId);
+                        break;
+                    case 2:
+                        await this.Send("223 {0} {1}\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
+                        break;
+                    case 3:
+                        await this.Send("223 {0} {1}\r\n", articleNewsgroup.Number, articleNewsgroup.Article.MessageId);
+                        break;
                 }
             }
 

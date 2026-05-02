@@ -40,7 +40,7 @@ namespace McNNTP.Core.Database
                 ExecuteNonQuery(connection, transaction, 
                     "CREATE INDEX IF NOT EXISTS idx_article_date ON Article (DateTimeParsed DESC)", logger);
                 ExecuteNonQuery(connection, transaction, 
-                    "CREATE INDEX IF NOT EXISTS idx_article_from ON Article (From)", logger);
+                    "CREATE INDEX IF NOT EXISTS idx_article_from ON Article (FromHeader)", logger);
 
                 // ArticleNewsgroup indexes (critical for performance)
                 ExecuteNonQuery(connection, transaction, 
@@ -64,7 +64,7 @@ namespace McNNTP.Core.Database
 
                 // Subscription indexes
                 ExecuteNonQuery(connection, transaction, 
-                    "CREATE INDEX IF NOT EXISTS idx_subscription_user_newsgroup ON Subscription (UserId, NewsgroupId)", logger);
+                    "CREATE INDEX IF NOT EXISTS idx_subscription_user_newsgroup ON Subscription (OwnerUserId, Newsgroup)", logger);
 
                 transaction.Commit();
                 logger?.LogInformation("Successfully created/verified all performance indexes");
