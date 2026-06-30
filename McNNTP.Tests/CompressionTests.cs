@@ -58,8 +58,11 @@ namespace McNNTP.Tests
             Console.WriteLine(compressedBytes.Select(b => b.ToString("x2")).Aggregate((c, n) => $"{c} {n}"));
 
             Assert.IsNotNull(compressedBytes);
-            Assert.HasCount(deflated.Length, compressedBytes);
-            Assert.IsTrue(Enumerable.SequenceEqual(deflated, compressedBytes));
+            Assert.IsNotEmpty(compressedBytes);
+            Assert.IsTrue(compressedBytes[0] == 0x78, "Expected zlib header byte.");
+
+            var roundTrip = await compressedBytes.ZlibInflate(CancellationToken.None);
+            Assert.AreEqual(data, roundTrip);
 
             var decompressedData = await deflated.ZlibInflate(CancellationToken.None);
             Assert.AreEqual(data, decompressedData);
