@@ -26,6 +26,7 @@
             this._logger = logger;
             this._loggerFactory = loggerFactory;
             this._connectionSemaphore = new SemaphoreSlim(MaxConcurrentConnections, MaxConcurrentConnections);
+            this._logger.LogInformation("NNTP Listener created on {endpoint}", localEp);
         }
 
         public PortClass PortType { get; set; }

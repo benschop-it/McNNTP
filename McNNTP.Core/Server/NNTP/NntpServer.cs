@@ -73,6 +73,8 @@ namespace McNNTP.Core.Server.NNTP
             this.AllowStartTLS = true;
             this.ShowData = true;
             this._cache = new ArticleCache();
+            this.ShowBytes = true;
+            this.ShowCommands = true;
         }
 
         /// <summary>

@@ -140,7 +140,7 @@ namespace McNNTP.Server.Console
 
                 // Build logger
                 Log.Logger = new LoggerConfiguration()
-                    .MinimumLevel.Debug()
+                    .MinimumLevel.Verbose()
                     .Enrich.FromLogContext()
                     .WriteTo.Console() // console sink
                     .WriteTo.File(
