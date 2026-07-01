@@ -361,24 +361,11 @@ namespace McNNTP.Core.Server.NNTP
                     }
 
                     // All the data has been read from the client. Display it on the console.
-                    if (this.ShowBytes && this.ShowData)
-                    {
-                        _logger.TraceFormat(
-                            "{0}:{1} >{2}> {3} bytes: {4}", this.RemoteAddress, this.RemotePort, this.TLS ? "!" : ">",
-                            content.Length,
-                            content.TrimEnd('\r', '\n'));
-                    }
-                    else if (this.ShowBytes)
+                    if (this.ShowBytes)
                     {
                         _logger.TraceFormat(
                             "{0}:{1} >{2}> {3} bytes", this.RemoteAddress, this.RemotePort, this.TLS ? "!" : ">",
                             content.Length);
-                    }
-                    else if (this.ShowData)
-                    {
-                        _logger.TraceFormat(
-                            "{0}:{1} >{2}> {3}", this.RemoteAddress, this.RemotePort, this.TLS ? "!" : ">",
-                            content.TrimEnd('\r', '\n'));
                     }
 
                     if (this.inProcessCommand != null && this.inProcessCommand.MessageHandler != null)
@@ -400,8 +387,11 @@ namespace McNNTP.Core.Server.NNTP
                                 if (this.ShowCommands)
                                 {
                                     _logger.TraceFormat(
-                                        "{0}:{1} >{2}> {3}", this.RemoteAddress, this.RemotePort, this.TLS ? "!" : ">",
-                                        content.TrimEnd('\r', '\n'));
+                                        "{0}:{1} >{2}> CMD {3}",
+                                        this.RemoteAddress,
+                                        this.RemotePort,
+                                        this.TLS ? "!" : ">",
+                                        command);
                                 }
 
                                 var result = await CommandDirectory[command].Invoke(this, content);
@@ -487,10 +477,6 @@ namespace McNNTP.Core.Server.NNTP
                     if (bytesRead <= 0)
                         return;
 
-                    // Log raw bytes as hex (DEBUG)
-                    _logger.LogDebug("RX {Remote}:{Port} {Count} bytes: {Hex}",
-                        this.RemoteAddress, this.RemotePort, bytesRead, ToHex(this.buffer, bytesRead));
-
                     if (_mode == ReadMode.PostData) {
                         // Append ALL bytes to post buffer
                         _postData.AddRange(this.buffer.Take(bytesRead));
@@ -533,10 +519,15 @@ namespace McNNTP.Core.Server.NNTP
                             var lineBytes = TakeAndRemoveRange(_rx, lineEnd + CrLf.Length);
                             var line = Encoding.ASCII.GetString(lineBytes); // includes CRLF
 
-                            if (this.ShowCommands)
-                                _logger.TraceFormat("{0}:{1} >{2}> {3}", this.RemoteAddress, this.RemotePort, this.TLS ? "!" : ">", line.TrimEnd('\r', '\n'));
-
                             var cmd = line.Split(' ')[0].Trim().ToUpperInvariant();
+
+                            if (this.ShowCommands)
+                                _logger.TraceFormat(
+                                    "{0}:{1} >{2}> CMD {3}",
+                                    this.RemoteAddress,
+                                    this.RemotePort,
+                                    this.TLS ? "!" : ">",
+                                    CommandDirectory.ContainsKey(cmd) ? cmd : "UNKNOWN");
 
                             if (!CommandDirectory.TryGetValue(cmd, out var handler)) {
                                 await this.Send("500 Unknown command\r\n");
@@ -792,18 +783,7 @@ namespace McNNTP.Core.Server.NNTP
             {
                 // Begin sending the data to the remote device.
                 await this.stream.WriteAsync(byteData, cancellationToken);
-                if (this.ShowBytes && this.ShowData)
-                {
-                    _logger.TraceFormat(
-                        "{0}:{1} <{2}{3} {4} bytes: {5}",
-                        this.RemoteAddress,
-                        this.RemotePort,
-                        this.TLS ? "!" : "<",
-                        compressedIfPossible && this.CompressionGZip ? "G" : "<",
-                        byteData.Length,
-                        data.TrimEnd('\r', '\n'));
-                }
-                else if (this.ShowBytes)
+                if (this.ShowBytes)
                 {
                     _logger.TraceFormat(
                         "{0}:{1} <{2}{3} {4} bytes",
@@ -812,16 +792,6 @@ namespace McNNTP.Core.Server.NNTP
                         this.TLS ? "!" : "<",
                         compressedIfPossible && this.CompressionGZip ? "G" : "<",
                         byteData.Length);
-                }
-                else if (this.ShowData)
-                {
-                    _logger.TraceFormat(
-                        "{0}:{1} <{2}{3} {4}",
-                        this.RemoteAddress,
-                        this.RemotePort,
-                        this.TLS ? "!" : "<",
-                        compressedIfPossible && this.CompressionGZip ? "G" : "<",
-                        data.TrimEnd('\r', '\n'));
                 }
 
                 return true;
